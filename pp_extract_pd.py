@@ -221,43 +221,70 @@ def read_fact(fct, maps, nodes, mkt_on, all_roots):
     wanted = week | period_sku
     mk = set(mkt_on["TAG"])
 
-    st = dict(rows=0, dup=0, bad=Counter(), empty=Counter(), mkt=set(), prod=set(), per=set())
-    parts, roots = [], []
-    log(f"читаю {src.name} ({src.stat().st_size // 2**20} МБ) кусками по {CHUNK:,} строк ...")
-    dtypes = {**{c: str for c in TAGS}, **{c: "float64" for c in FACTS}}
-    reader = pd.read_csv(src, sep="|", usecols=TAGS + FACTS, dtype=dtypes,
-                         chunksize=CHUNK, encoding="utf-8-sig")
-    for c in reader:
-        for f in FACTS:
-            c[f] = c[f] / 10 ** prec[f]
+    def scan(robust):
+        st = dict(rows=0, dup=0, bad=Counter(), empty=Counter(), odd=Counter(), odd_ex=set(),
+                  mkt=set(), prod=set(), per=set())
+        parts, roots = [], []
+        if robust:
+            # Медленный путь: факты текстом, в числа переводим сами. Нечисловое не роняет
+            # скрипт и не теряется молча: считаем и показываем в проверках.
+            opts = dict(dtype=str)
+        else:
+            # Быстрый путь. skipinitialspace: пустой факт Nielsen пишет то пустой строкой,
+            # то пробелом, а на пробеле pandas падает («could not convert string to float: ' '»).
+            opts = dict(dtype={**{c: str for c in TAGS}, **{c: "float64" for c in FACTS}},
+                        skipinitialspace=True)
+        log(f"читаю {src.name} ({src.stat().st_size // 2**20} МБ) кусками по {CHUNK:,} строк ...")
+        with pd.read_csv(src, sep="|", usecols=TAGS + FACTS, chunksize=CHUNK,
+                         encoding="utf-8-sig", **opts) as reader:
+            for c in reader:
+                for f in FACTS:
+                    if robust:
+                        num = pd.to_numeric(c[f], errors="coerce")
+                        odd = c[f][num.isna() & c[f].notna()]
+                        odd = odd[odd.str.strip() != ""]
+                        if len(odd):
+                            st["odd"][f] += len(odd)
+                            st["odd_ex"].update(odd.head(3))
+                        c[f] = num
+                    c[f] = c[f] / 10 ** prec[f]
 
-        # проверки — по всем строкам, до фильтров
-        st["rows"] += len(c)
-        st["dup"] += int(c.duplicated(TAGS).sum())
-        for x, y, z in PAIRS:
-            # Каждый факт Nielsen округляет отдельно: 1 в последнем знаке — норма.
-            st["bad"][f"{x}={y}+{z}"] += int(((c[x].fillna(0) - c[y].fillna(0) - c[z].fillna(0)).abs()
-                                              > 1.5e-4).sum())
-        for f in EMPTY:
-            st["empty"][f] += int(c[f].isna().sum())
-        for k, t in (("mkt", "MKT_TAG"), ("prod", "PROD_TAG"), ("per", "PER_TAG")):
-            st[k].update(c[t].unique())
-        roots.append(c[c["PROD_TAG"].isin(all_roots)])
+                # проверки — по всем строкам, до фильтров
+                st["rows"] += len(c)
+                st["dup"] += int(c.duplicated(TAGS).sum())
+                for x, y, z in PAIRS:
+                    # Каждый факт Nielsen округляет отдельно: 1 в последнем знаке — норма.
+                    st["bad"][f"{x}={y}+{z}"] += int(((c[x].fillna(0) - c[y].fillna(0)
+                                                       - c[z].fillna(0)).abs() > 1.5e-4).sum())
+                for f in EMPTY:
+                    st["empty"][f] += int(c[f].isna().sum())
+                for k, t in (("mkt", "MKT_TAG"), ("prod", "PROD_TAG"), ("per", "PER_TAG")):
+                    st[k].update(c[t].unique())
+                roots.append(c[c["PROD_TAG"].isin(all_roots)])
 
-        # суммы по периодам — только нужные рынки и узлы
-        b = blocks(c[c["MKT_TAG"].isin(mk) & c["PROD_TAG"].isin(wanted)])
-        for ptype, m in maps.items():
-            nodes_here = week if ptype == "Неделя" else period_sku if ptype in SKU_PERIODS else period
-            s = b[b["PROD_TAG"].isin(nodes_here)]
-            lab = s["PER_TAG"].map(m)
-            s = s[lab.notna()].drop(columns="PER_TAG").assign(ptype=ptype, period=lab[lab.notna()])
-            parts.append(s.groupby(KEYS, sort=False).sum())
-        log(f"  прочитано {st['rows']:,} строк")
+                # суммы по периодам — только нужные рынки и узлы
+                b = blocks(c[c["MKT_TAG"].isin(mk) & c["PROD_TAG"].isin(wanted)])
+                for ptype, m in maps.items():
+                    nodes_here = week if ptype == "Неделя" else period_sku if ptype in SKU_PERIODS else period
+                    s = b[b["PROD_TAG"].isin(nodes_here)]
+                    lab = s["PER_TAG"].map(m)
+                    s = s[lab.notna()].drop(columns="PER_TAG").assign(ptype=ptype, period=lab[lab.notna()])
+                    parts.append(s.groupby(KEYS, sort=False).sum())
+                log(f"  прочитано {st['rows']:,} строк")
 
-    # Узел-период может попасть в два соседних куска: складываем ещё раз.
-    agg = pd.concat(parts).groupby(level=KEYS, sort=False).sum().reset_index()
-    log(f"  строк в агрегате: {len(agg):,}")
-    return agg, pd.concat(roots), st
+        # Узел-период может попасть в два соседних куска: складываем ещё раз.
+        agg = pd.concat(parts).groupby(level=KEYS, sort=False).sum().reset_index()
+        log(f"  строк в агрегате: {len(agg):,}")
+        return agg, pd.concat(roots), st
+
+    try:
+        return scan(robust=False)
+    except ValueError as e:
+        if "could not convert" not in str(e):
+            raise
+        log(f"!!! В fact_data нечисловое значение ({e}). Перечитываю медленнее, факты текстом, "
+            f"чтобы найти и посчитать все такие ячейки ...")
+        return scan(robust=True)
 
 
 def checks(st, roots, root, other_roots, dicts):
@@ -267,6 +294,12 @@ def checks(st, roots, root, other_roots, dicts):
     alien = [len(st[k] - set(dicts[k]["TAG"])) for k in ("mkt", "prod", "per")]
     log(("!!! " if any(alien) else "") +
         f"Тегов вне справочников: MKT {alien[0]}, PROD {alien[1]}, PER {alien[2]}")
+    if st["odd"]:
+        log("!!! Нечисловые значения в фактах (взяты как пропуск): " +
+            ", ".join(f"{f} {n:,}" for f, n in st["odd"].items()) +
+            "; примеры: " + ", ".join(repr(x) for x in sorted(st["odd_ex"])[:10]))
+    else:
+        log("Нечисловых значений в фактах нет (пустые и пробелы — это пропуски)")
     if any(st["bad"].values()):
         log("!!! Группы не сходятся (строк): " + ", ".join(f"{k}: {v}" for k, v in st["bad"].items() if v))
     else:
@@ -306,7 +339,10 @@ def channel_universe(roots, root, maps):
 
 
 def build(agg, nodes, mkt_on, periods, univ):
-    a = (agg.merge(nodes, left_on="PROD_TAG", right_on="TAG")
+    # Из справочника узлов — только нужные колонки: агрегат длинный, лишние раздувают память.
+    keep = ["TAG", "SHORT", "MANUFACTURER", "BRAND", "PACKAGE TYPE", "sku_name", "mareven", "level",
+            "ord", "in_period", "in_sku"]
+    a = (agg.merge(nodes[keep], left_on="PROD_TAG", right_on="TAG")
             .merge(mkt_on[["TAG", "SHORT", "ord"]].rename(columns={"TAG": "MKT_TAG", "SHORT": "mkt", "ord": "mord"}),
                    on="MKT_TAG")
             .merge(periods.rename(columns={"n": "weeks"}), on=["ptype", "period"])
