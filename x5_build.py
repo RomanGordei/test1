@@ -145,9 +145,27 @@ def load_contour(name):
     df = read_source(name)
     exact = df.duplicated()
     if exact.any():
-        log(f"  ! полных дублей строк: {int(exact.sum())} (убраны)")
+        by_period = df.loc[exact, "Период"].value_counts().sort_index()
+        log(f"  ! полных дублей строк: {int(exact.sum())} (убраны), по периодам: "
+            + ", ".join(f"{p}: {n}" for p, n in by_period.items()))
         df = df[~exact]
     clash = df.duplicated(CELL + ["PLU"], keep=False)
+
+    # Итог категории, загруженный в клик дважды с разными цифрами: остаётся тот, что ближе к сумме PLU своей клетки
+    twice = clash & df["ЭтоИтог"]
+    if twice.any():
+        plu_sum = df[~df["ЭтоИтог"]].groupby(CELL)["TOTAL_Руб"].sum().rename("СуммаPLU")
+        t = df[twice].join(plu_sum, on=CELL)
+        t["Отклонение"] = (t["TOTAL_Руб"] - t["СуммаPLU"]).abs()
+        worse = t.sort_values("Отклонение").duplicated(CELL, keep="first")
+        rub = lambda v: f"{v:,.2f}".replace(",", " ")
+        for (start, net, reg), g in t.groupby(CELL):
+            log(f"  ! итог категории загружен {len(g)} раза: {net}, {reg}, {start:%d.%m.%Y}: "
+                f"{' и '.join(rub(v) for v in g['TOTAL_Руб'])} руб; сумма PLU {rub(g['СуммаPLU'].iloc[0])}, "
+                f"оставлен ближайший к ней")
+        df = df.drop(index=worse[worse].index)
+        clash = df.duplicated(CELL + ["PLU"], keep=False)
+
     if clash.any():
         ex = df[clash].sort_values(CELL + ["PLU"]).head(4)[CELL + ["PLU", "TOTAL_Руб"]]
         raise SystemExit(f"СТОП. {RAW[name].name}: разные строки с одним ключом период × сеть × регион × PLU: "
