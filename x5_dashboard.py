@@ -1,12 +1,12 @@
 """Автономный HTML-дашборд X5 Dialog по файлам куба.
 
 Запуск:  python x5_dashboard.py   (после x5_build.py)
-Нужно:   pip install pandas numpy
+Нужно:   pandas и numpy (уже стоят для x5_build.py)
 
 Что делает:
   1. Читает CSV куба (факты, итоги категории, календарь, продукты, регионы).
-  2. Сворачивает факты до неделя (месяц) × сеть × ФО × PLU. Части взвешенной глубины промо считаются
-     до свёртки, на строках регионов, поэтому мера совпадает с Excel.
+  2. Собирает факты по неделям (месяцам) × сети × региону × PLU (или до ФО, если REGIONS = False).
+     Части взвешенной глубины промо считаются на строках регионов, поэтому мера совпадает с Excel.
   3. Упаковывает данные в сжатый бинарный блок и встраивает его в HTML вместе со страницей.
   Результат: два файла в папке куба, X5_дашборд_недели.html и X5_дашборд_месяцы.html.
   Интернет для открытия не нужен, достаточно Chrome или Edge.
@@ -24,11 +24,14 @@ BASE = Path(r"R:\2.ДКП\ПЭП\02_Аналитика\03_Базы данных\
 CUBE = BASE / "Cube"                      # папка, куда пишет x5_build.py
 OUT = CUBE                                # куда класть HTML
 OWN_PRODUCER = "Маревен Фуд Сэнтрал"      # выделяется цветом на графиках производителей
-START_YEAR = None                         # например 2024, чтобы облегчить файл; у первого года не будет ПГ
+START_YEAR = None                         # например 2024, чтобы облегчить файл; у первого года не будет YA
+REGIONS = True                            # False — свести данные до ФО: файл в разы легче, но без среза по регионам
 CONTOURS = {"weekly": "недели", "monthly": "месяцы"}
 TITLE = "X5 Dialog · Продукция быстрого приготовления"
 
-FACT_COLS = ["TOTAL_Шт", "TOTAL_Руб", "TOTAL_КгЛ", "PROMO_Шт", "PROMO_Руб", "TOTAL_Магазины"]  # промо-рубли нужны для глубины
+# Только суммируемые базы (плюс магазины для TDP): из них страница считает доли, цены и динамику
+FACT_COLS = ["TOTAL_Шт", "TOTAL_Руб", "TOTAL_КгЛ", "PROMO_Шт", "PROMO_Руб", "PROMO_КгЛ",
+             "LOYAL_Шт", "LOYAL_Руб", "LOYAL_КгЛ", "TOTAL_Магазины"]
 
 
 def read(name, **kw):
@@ -110,6 +113,7 @@ def build(contour):
     pg = cal["НачалоПериодаПГ"].map(per_index).fillna(-1).astype(int)
 
     regions = read("x5_regions", dtype=str).fillna("")
+    regions["ФО"] = regions["ФО"].replace("", "Не указан")
     reg_fo = dict(zip(regions["Регион"], regions["ФО"]))
     products = read("x5_products", dtype=str).fillna("")
     for c in ["Категория", "Производитель (корректный)", "Бренд (корректный)", "Название"]:
@@ -133,21 +137,27 @@ def build(contour):
 
     nets = sorted(fact["Сеть"].unique())
     fos = sorted(fact["ФО"].unique())
+    # География данных: регионы (каждый со своим ФО) или сразу ФО
+    if REGIONS:
+        geo = fact[["ФО", "Регион"]].drop_duplicates().sort_values(["ФО", "Регион"])
+        geo_names, geo_col = geo["Регион"].tolist(), "Регион"
+        geo_fo = codes(geo["ФО"], fos).tolist()
+    else:
+        geo_names, geo_col, geo_fo = fos, "ФО", list(range(len(fos)))
     fact["p"] = codes(fact["НачалоПериода"], list(per_index))
     fact["n"] = codes(fact["Сеть"], nets)
-    fact["f"] = codes(fact["ФО"], fos)
+    fact["g"] = codes(fact[geo_col], geo_names)
     fact["k"] = codes(fact["PLU"], list(products["PLU"]))
     values = FACT_COLS + ["ГлубинаПолн", "ГлубинаОпл"]
-    agg = fact.groupby(["k", "n", "f", "p"], as_index=False, sort=True)[values].sum()
+    agg = fact.groupby(["k", "n", "g", "p"], as_index=False, sort=True)[values].sum()
     agg = agg[(agg[values] != 0).any(axis=1)].reset_index(drop=True)
 
     cat = read(f"x5_{contour}_category", usecols=["НачалоПериода", "Сеть", "Регион", "TOTAL_Магазины"], dtype=keys)
     cat["НачалоПериода"] = pd.to_datetime(cat["НачалоПериода"])
-    cat = cat[cat["НачалоПериода"].isin(per_index) & cat["Сеть"].isin(nets)]
     cat["ФО"] = cat["Регион"].map(reg_fo)
-    cat = cat[cat["ФО"].isin(fos)]
-    cat["p"], cat["n"], cat["f"] = codes(cat["НачалоПериода"], list(per_index)), codes(cat["Сеть"], nets), codes(cat["ФО"], fos)
-    cagg = cat.groupby(["p", "n", "f"], as_index=False, sort=True)["TOTAL_Магазины"].sum()
+    cat = cat[cat["НачалоПериода"].isin(per_index) & cat["Сеть"].isin(nets) & cat[geo_col].isin(geo_names)]
+    cat["p"], cat["n"], cat["g"] = codes(cat["НачалоПериода"], list(per_index)), codes(cat["Сеть"], nets), codes(cat[geo_col], geo_names)
+    cagg = cat.groupby(["p", "n", "g"], as_index=False, sort=True)["TOTAL_Магазины"].sum()
 
     # Справочники для срезов: продукты, производители и бренды по убыванию продаж
     units_by_k = agg.groupby("k")["TOTAL_Шт"].sum().reindex(range(len(products)), fill_value=0)
@@ -173,7 +183,8 @@ def build(contour):
                     "month": cal["Месяц"].tolist(), "quarter": cal["Квартал"].tolist(), "ord": cal["Номер"].tolist(),
                     "start": cal["НачалоПериода"].dt.strftime("%d.%m.%Y").tolist(),
                     "end": cal["КонецПериода"].dt.strftime("%d.%m.%Y").tolist(), "pg": pg.tolist()},
-        "nets": nets, "fos": fos, "categories": categories, "producers": producers, "brands": brands,
+        "nets": nets, "fos": fos, "regionLevel": REGIONS, "regions": geo_names if REGIONS else [], "geoFo": geo_fo,
+        "categories": categories, "producers": producers, "brands": brands,
         "products": {"plu": products["PLU"].tolist(), "name": products["Название"].tolist(),
                      "cat": codes(products["Категория"], categories).tolist(),
                      "prod": codes(products["Производитель (корректный)"], producers).tolist(),
@@ -182,20 +193,38 @@ def build(contour):
         "slots": [slots.get(name, -1) for name in producers],
         "check": {"rows": int(len(agg)), "units": float(agg["TOTAL_Шт"].sum()), "catRows": int(len(cagg))},
     }
-    # Рубли храним с копейками: целые рубли (int32) + копейки (0..99) отдельной колонкой
-    kop = np.round(agg["TOTAL_Руб"].to_numpy("f8") * 100)
-    rub = np.floor_divide(kop, 100)
+    def rub_kop(col):
+        """Рубли с копейками: целые рубли (int32) + копейки (0..99) отдельной колонкой."""
+        kop = np.round(agg[col].to_numpy("f8") * 100)
+        rub = np.floor_divide(kop, 100)
+        return as_int(pd.Series(rub), col), ((kop - rub * 100).astype("u1"), "u8")
+
+    geo_type = ("u1", "u8") if len(geo_names) <= 255 else ("<u2", "u16")
     columns = {
         "P": (agg["p"].to_numpy("<u2"), "u16"), "N": (agg["n"].to_numpy("u1"), "u8"),
-        "F": (agg["f"].to_numpy("u1"), "u8"), "K": (agg["k"].to_numpy("<u2"), "u16"),
-        "U": as_int(agg["TOTAL_Шт"], "TOTAL_Шт", exact=True), "R": as_int(pd.Series(rub), "TOTAL_Руб"), "Rk": ((kop - rub * 100).astype("u1"), "u8"),
-        "G": as_int(agg["TOTAL_КгЛ"] * 100, "TOTAL_КгЛ"), "PU": as_int(agg["PROMO_Шт"], "PROMO_Шт", exact=True),
-        "S": as_u16(agg["TOTAL_Магазины"], "TOTAL_Магазины"), "DF": as_int(agg["ГлубинаПолн"], "ГлубинаПолн"),
-        "DS": as_int(agg["ГлубинаПолн"] - agg["ГлубинаОпл"], "ГлубинаСкидка"),
+        "Geo": (agg["g"].to_numpy(geo_type[0]), geo_type[1]), "K": (agg["k"].to_numpy("<u2"), "u16"),
+        "U": as_int(agg["TOTAL_Шт"], "TOTAL_Шт", exact=True),
+        "G": as_int(agg["TOTAL_КгЛ"] * 1000, "TOTAL_КгЛ"),                      # кг/л хранятся в граммах
+        "PU": as_int(agg["PROMO_Шт"], "PROMO_Шт", exact=True), "LU": as_int(agg["LOYAL_Шт"], "LOYAL_Шт", exact=True),
+        "S": as_u16(agg["TOTAL_Магазины"], "TOTAL_Магазины"),
         "cP": (cagg["p"].to_numpy("<u2"), "u16"), "cN": (cagg["n"].to_numpy("u1"), "u8"),
-        "cF": (cagg["f"].to_numpy("u1"), "u8"), "cS": as_int(cagg["TOTAL_Магазины"], "cS", exact=True),
+        "cGeo": (cagg["g"].to_numpy(geo_type[0]), geo_type[1]), "cS": as_int(cagg["TOTAL_Магазины"], "cS", exact=True),
     }
-    if len(products) > 65535 or len(cal) > 65535 or len(nets) > 255 or len(fos) > 255:
+    for name, col in [("R", "TOTAL_Руб"), ("PR", "PROMO_Руб"), ("LR", "LOYAL_Руб")]:
+        columns[name], columns[name + "k"] = rub_kop(col)
+    # Килограммы промо и по картам у одного SKU — это штуки × вес штуки. Если так и есть, страница считает их сама
+    # и файл легче; если хоть где-то не сходится, колонки кладутся как есть.
+    weight = np.divide(agg["TOTAL_КгЛ"], agg["TOTAL_Шт"], out=np.zeros(len(agg)), where=agg["TOTAL_Шт"].to_numpy() != 0)
+    same = lambda kg, units: np.allclose(agg[kg], agg[units] * weight, rtol=2e-3, atol=0.005)
+    if not (same("PROMO_КгЛ", "PROMO_Шт") and same("LOYAL_КгЛ", "LOYAL_Шт")):
+        print("  кг промо и по картам не сводятся к штукам × вес: кладу их в файл отдельно")
+        columns["PG"] = as_int(agg["PROMO_КгЛ"] * 1000, "PROMO_КгЛ")
+        columns["LG"] = as_int(agg["LOYAL_КгЛ"] * 1000, "LOYAL_КгЛ")
+    # Части глубины промо: на уровне регионов страница считает их из строк сама, после свёртки до ФО — только готовые
+    if not REGIONS:
+        columns["DF"] = as_int(agg["ГлубинаПолн"], "ГлубинаПолн")
+        columns["DS"] = as_int(agg["ГлубинаПолн"] - agg["ГлубинаОпл"], "ГлубинаСкидка")
+    if len(products) > 65535 or len(cal) > 65535 or len(nets) > 255 or len(geo_names) > 65535:
         raise SystemExit("СТОП. Справочники не помещаются в формат файла.")
     meta["columns"], data, raw_size = pack(columns)
     return meta, data, len(fact), raw_size
@@ -213,8 +242,11 @@ def main():
         meta, data, fact_rows, raw = build(contour)
         path = OUT / f"X5_дашборд_{name}.html"
         path.write_text(render(meta, data), encoding="utf-8")
-        print(f"{path.name}: строк фактов {fact_rows} -> после свёртки до ФО {meta['check']['rows']}, "
-              f"данные {raw / 1e6:.0f} МБ -> файл {path.stat().st_size / 1e6:.1f} МБ")
+        size = path.stat().st_size / 1e6
+        print(f"{path.name}: строк фактов {fact_rows} -> после свёртки до {'регионов' if REGIONS else 'ФО'} "
+              f"{meta['check']['rows']}, данные {raw / 1e6:.0f} МБ -> файл {size:.1f} МБ")
+        if size > 25 and not START_YEAR:
+            print("  Файл тяжёлый для почты. Облегчить: START_YEAR = 2024 или REGIONS = False (только ФО).")
     print(f"Готово. Файлы лежат в {OUT}")
 
 
@@ -224,6 +256,7 @@ TEMPLATE = r'''<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__X5_TITLE__</title>
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('x5-theme') || 'light'; } catch (e) { document.documentElement.dataset.theme = 'light'; }</script>
 <style>
 :root {
   color-scheme: light;
@@ -231,15 +264,6 @@ TEMPLATE = r'''<!DOCTYPE html>
   --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10); --wash: rgba(11,11,11,0.05);
   --good: #006300; --bad: #d03b3b; --other: #898781; --track: #f0efec;
   --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948;
-}
-@media (prefers-color-scheme: dark) {
-  :root:where(:not([data-theme="light"])) {
-    color-scheme: dark;
-    --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781;
-    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10); --wash: rgba(255,255,255,0.07);
-    --good: #0ca30c; --bad: #e66767; --other: #898781; --track: #262624;
-    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #0ca30c; --s7: #9085e9; --s8: #e66767;
-  }
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
@@ -251,11 +275,28 @@ TEMPLATE = r'''<!DOCTYPE html>
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 body { margin: 0; background: var(--page); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
-.wrap { max-width: 1440px; margin: 0 auto; padding: 20px 24px 40px; }
+.wrap { max-width: 1600px; margin: 0 auto; padding: 20px 24px 40px; }
 h1 { font-size: 20px; font-weight: 600; margin: 0; }
 .sub { color: var(--ink2); font-size: 13px; margin-top: 2px; }
 .filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 16px 0; position: sticky; top: 0; z-index: 30;
   background: var(--page); padding: 8px 0; border-bottom: 1px solid var(--border); }
+.filters .spacer { flex: 1; }
+.layout { display: grid; grid-template-columns: 248px minmax(0, 1fr); gap: 20px; align-items: start; }
+.side { position: sticky; top: 64px; max-height: calc(100vh - 76px); overflow-y: auto; display: flex; flex-direction: column; gap: 12px;
+  padding-right: 4px; }
+.side h3 { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 6px 0 -4px; }
+.fl { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 10px 0 6px; }
+.fl-head { display: flex; align-items: baseline; gap: 8px; padding: 0 12px 6px; }
+.fl-title { font-weight: 600; font-size: 13px; }
+.fl-count { color: var(--s1); font-size: 12px; }
+.fl-reset { margin-left: auto; border: 0; background: none; color: var(--ink2); font: inherit; font-size: 12px; cursor: pointer; padding: 0; }
+.fl-reset:hover { color: var(--ink); text-decoration: underline; }
+.fl .ms-search { margin: 0 12px 6px; width: calc(100% - 24px); }
+.fl .ms-list { max-height: 228px; padding: 0 0 4px; }
+.fl .ms-item { padding: 3px 12px; font-size: 13px; }
+.fl .ms-item.own span { font-weight: 600; }
+.main { min-width: 0; }
+@media (max-width: 1100px) { .layout { grid-template-columns: minmax(0, 1fr); } .side { position: static; max-height: none; } }
 .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface); }
 .seg button { border: 0; background: transparent; color: var(--ink2); padding: 6px 12px; font: inherit; cursor: pointer; }
 .seg button + button { border-left: 1px solid var(--border); }
@@ -271,7 +312,10 @@ h1 { font-size: 20px; font-weight: 600; margin: 0; }
   border-radius: 8px; background: var(--surface); }
 .select { height: 30px; border: 0; background: transparent; color: var(--ink); font: inherit; font-weight: 500; padding: 0 6px; max-width: 230px; cursor: pointer; }
 .select option { background: var(--surface); color: var(--ink); }
-.period { color: var(--ink2); font-size: 13px; margin: -6px 0 14px; }
+.period { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; color: var(--ink2); font-size: 13px; margin: -6px 0 14px; }
+.period .spacer { flex: 1; }
+.card-actions { display: flex; gap: 6px; }
+.status { color: var(--ink2); font-size: 12px; }
 .period b { color: var(--ink); font-weight: 600; }
 .period .warn { color: var(--ink); }
 .ms-panel { position: absolute; top: 36px; left: 0; z-index: 40; width: 300px; max-height: 360px; display: flex; flex-direction: column;
@@ -283,10 +327,10 @@ h1 { font-size: 20px; font-weight: 600; margin: 0; }
 .ms-item:hover { background: var(--wash); }
 .ms-item input { margin: 0; accent-color: var(--s1); }
 .ms-all { border-bottom: 1px solid var(--border); padding-bottom: 6px; margin-bottom: 4px; font-weight: 500; }
-.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 16px; }
-.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(136px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; min-width: 0; }
 .tile .label { color: var(--ink2); font-size: 13px; }
-.tile .value { font-size: 26px; font-weight: 600; margin-top: 4px; }
+.tile .value { font-size: clamp(18px, 1.55vw, 24px); font-weight: 600; margin-top: 4px; white-space: nowrap; }
 .delta { font-size: 13px; margin-top: 2px; white-space: nowrap; }
 .good { color: var(--good); } .bad { color: var(--bad); } .neutral { color: var(--ink2); } .none { color: var(--muted); }
 .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-bottom: 16px; }
@@ -398,6 +442,7 @@ footer p { margin: 4px 0; max-width: 1100px; }
     rub: v => ok(v) ? nf2.format(v) + ' ₽' : '—',
     idx: v => ok(v) ? nf2.format(v) : '—',
     tdp: v => ok(v) ? nf1.format(v * 100) : '—',
+    sales: v => ok(v) ? (Math.abs(v) >= 100 || v === 0 ? nf0 : nf1).format(v) : '—',
   };
   // Изменение: проценты (pct, v — доля), процентные пункты (pp) или пункты TDP (pt). Ноль после округления — без стрелки.
   function delta(v, kind) {
@@ -457,6 +502,7 @@ footer p { margin: 4px 0; max-width: 1100px; }
   const nN = META.nets.length, nF = META.fos.length, nK = META.products.plu.length;
   const nProd = META.producers.length, nBrand = META.brands.length;
   const catOf = META.products.cat, prodOf = META.products.prod, brandOf = META.products.brand;
+  const geoFo = META.geoFo, nGeo = geoFo.length, regionLevel = META.regionLevel;   // регион (или ФО) -> ФО
   // Свой бренд — больше половины его SKU у своего производителя (в классификаторе бывают единичные чужие SKU)
   const ownCnt = new Int32Array(nBrand), allCnt = new Int32Array(nBrand);
   for (let k = 0; k < nK; k++) { allCnt[brandOf[k]]++; if (prodOf[k] === META.own) ownCnt[brandOf[k]]++; }
@@ -485,13 +531,17 @@ footer p { margin: 4px 0; max-width: 1100px; }
     const y = Math.floor(a.o / 12), mo = a.o - y * 12;
     return { short: mo === 0 ? `${MON3[0]} ${String(y).slice(2)}` : MON3[mo], long: `${MONTHS[mo]} ${y}` + (a.p < 0 ? ' · нет данных' : '') };
   }
+  // Единица, в которой считаются продажи, доли, доля промо и доля по картам
+  const MEASURES = [['U', 'шт', 'В штуках'], ['R', 'руб', 'В рублях'], ['G', 'кг', 'В килограммах (литрах)']];
+  const mu = () => MEASURES.find(m => m[0] === state.unit)[1];
+  const salesDigits = () => (state.unit === 'U' ? 0 : state.unit === 'R' ? 2 : 3);
   const periodName = p => (weekly ? `${per.label[p]} · ${per.start[p].slice(0, 5)}–${per.end[p].slice(0, 5)}`
     : `${MONTHS[per.month[p] - 1]} ${per.year[p]}`);
 
   // ---------- состояние и расчёт ----------
-  const DEFAULTS = { span: 'YTD', cmp: 'YA' };
-  const state = { end: nP - 1, span: DEFAULTS.span, cmp: DEFAULTS.cmp,
-    nets: new Set(), fos: new Set(), cats: new Set(), prods: new Set(), brands: new Set() };
+  const DEFAULTS = { span: 'YTD', cmp: 'YA', unit: 'U', block: 'T' };
+  const state = { end: nP - 1, ...DEFAULTS,
+    nets: new Set(), fos: new Set(), regs: new Set(), cats: new Set(), prods: new Set(), brands: new Set() };
 
   function mask(n, set) {
     const m = new Uint8Array(n);
@@ -522,6 +572,35 @@ footer p { margin: 4px 0; max-width: 1100px; }
     return { W, C, lo, oe, len, missing: len - W.length, cmpMissing: (st.cmp === 'YA' ? W.length : len) - C.length };
   }
 
+  // Маски срезов: сеть, география (ФО и регион), категория, производитель и бренд
+  function masks(st) {
+    const netM = mask(nN, st.nets), foM = mask(nF, st.fos), regM = mask(nGeo, st.regs);
+    const geoOk = new Uint8Array(nGeo);
+    for (let g = 0; g < nGeo; g++) geoOk[g] = foM[geoFo[g]] && regM[g] ? 1 : 0;
+    const catM = new Uint8Array(nK), fullM = new Uint8Array(nK);
+    for (let k = 0; k < nK; k++) {
+      const c = st.cats.size === 0 || st.cats.has(catOf[k]);
+      catM[k] = c ? 1 : 0;
+      fullM[k] = c && (st.prods.size === 0 || st.prods.has(prodOf[k])) && (st.brands.size === 0 || st.brands.has(brandOf[k])) ? 1 : 0;
+    }
+    return { netM, geoOk, catM, fullM };
+  }
+
+  // Значение в выбранной единице. Рубли — с копейками; кг без своей колонки — штуки × вес штуки этой строки.
+  function measureOf(unit, units, rub, kop, kg) {
+    const U = D.U, G = D.G;
+    if (unit === 'U') return i => units[i];
+    if (unit === 'R') return i => rub[i] + kop[i] * 0.01;
+    if (kg) return i => kg[i] * 0.001;
+    return i => (U[i] ? units[i] * G[i] * 0.001 / U[i] : 0);
+  }
+  // Блоки метрик X5: TOTAL — все продажи, PROMO — продажи по промо, LOYAL — продажи по картам лояльности
+  const BLOCKS = [['T', 'Тотал', '', 'Все продажи'], ['P', 'Промо', 'промо', 'Продажи по промо'], ['L', 'Лояльные', 'по картам', 'Продажи по картам лояльности']];
+  const blockArrays = b => (b === 'T' ? [D.U, D.R, D.Rk, D.G] : b === 'P' ? [D.PU, D.PR, D.PRk, D.PG] : [D.LU, D.LR, D.LRk, D.LG]);
+  const valueOf = (b, unit) => measureOf(unit, ...blockArrays(b));
+  const bw = () => BLOCKS.find(b => b[0] === state.block)[2];          // '', 'промо', 'по картам'
+  const bwSp = () => (bw() ? ' ' + bw() : '');
+
   function compute(st) {
     const win = periodWindow(st);
     const pf = new Uint8Array(nP);   // 1 — окно, 2 — сравнение, 4 — ось графиков, 8 — YA для графика
@@ -533,56 +612,74 @@ footer p { margin: 4px 0; max-width: 1100px; }
       axis.push({ o, p });
       if (p >= 0) { pf[p] |= 4; if (per.pg[p] >= 0) pf[per.pg[p]] |= 8; }
     }
-    const netM = mask(nN, st.nets), foM = mask(nF, st.fos);
-    const catM = new Uint8Array(nK), fullM = new Uint8Array(nK);
-    for (let k = 0; k < nK; k++) {
-      const c = st.cats.size === 0 || st.cats.has(catOf[k]);
-      catM[k] = c ? 1 : 0;
-      fullM[k] = c && (st.prods.size === 0 || st.prods.has(prodOf[k])) && (st.brands.size === 0 || st.brands.has(brandOf[k])) ? 1 : 0;
-    }
-    let wU = 0, wR = 0, wPU = 0, catU = 0, catR = 0, catG = 0, cU = 0, cR = 0, cPU = 0, cCatU = 0;
-    const selU_p = new Float64Array(nP), selS_p = new Float64Array(nP), catU_p = new Float64Array(nP), catS_p = new Float64Array(nP);
-    const prodU = new Float64Array(nProd), prodPU = new Float64Array(nProd), prodDF = new Float64Array(nProd), prodDS = new Float64Array(nProd);
-    const prodU_p = new Float64Array(nP * nProd);
-    const brU = new Float64Array(nBrand), brR = new Float64Array(nBrand), brG = new Float64Array(nBrand), brPU = new Float64Array(nBrand);
-    const brC = new Float64Array(nBrand), brS_p = new Float64Array(nP * nBrand);
-    const foU = new Float64Array(nF), foC = new Float64Array(nF), foCat = new Float64Array(nF), foCatC = new Float64Array(nF);
-    const nU = new Float64Array(nN), nC = new Float64Array(nN), nCat = new Float64Array(nN), nCatC = new Float64Array(nN);
-    const skU = new Float64Array(nK), skR = new Float64Array(nK), skPU = new Float64Array(nK), skC = new Float64Array(nK);
-    const P = D.P, N = D.N, F = D.F, K = D.K, U = D.U, R = D.R, Rk = D.Rk, G = D.G, PU = D.PU, S = D.S, DF = D.DF, DS = D.DS;
+    const { netM, geoOk, catM, fullM } = masks(st);
+    // t, p, l — тотал, промо и продажи по картам в выбранной единице; m — продажи выбранного блока.
+    // Цены блока — его рубли к его штукам и килограммам.
+    const tOf = valueOf('T', st.unit), pOf = valueOf('P', st.unit), lOf = valueOf('L', st.unit);
+    const bUof = valueOf(st.block, 'U'), bRof = valueOf(st.block, 'R'), bGof = valueOf(st.block, 'G');
+    const promoRub = valueOf('P', 'R');
+    const blk = st.block;
+    let wM = 0, wT = 0, wP = 0, wL = 0, wU = 0, wR = 0, wG = 0, wDF = 0, wDS = 0, catV = 0, catR = 0, catG = 0;
+    let cmpM = 0, cmpT = 0, cmpP = 0, cmpL = 0, cmpU = 0, cmpR = 0, cmpG = 0, cmpDF = 0, cmpDS = 0, cmpCat = 0;
+    const selM_p = new Float64Array(nP), selS_p = new Float64Array(nP), catM_p = new Float64Array(nP), catS_p = new Float64Array(nP);
+    const prodM = new Float64Array(nProd), prodT = new Float64Array(nProd), prodP = new Float64Array(nProd), prodL = new Float64Array(nProd);
+    const prodDF = new Float64Array(nProd), prodDS = new Float64Array(nProd), prodM_p = new Float64Array(nP * nProd);
+    const brM = new Float64Array(nBrand), brC = new Float64Array(nBrand), brT = new Float64Array(nBrand), brP = new Float64Array(nBrand);
+    const brL = new Float64Array(nBrand), brU = new Float64Array(nBrand), brR = new Float64Array(nBrand), brG = new Float64Array(nBrand);
+    const brDF = new Float64Array(nBrand), brDS = new Float64Array(nBrand), brS_p = new Float64Array(nP * nBrand);
+    const foV = new Float64Array(nF), foC = new Float64Array(nF), foCat = new Float64Array(nF), foCatC = new Float64Array(nF);
+    const geoV = new Float64Array(nGeo), geoC = new Float64Array(nGeo), geoCat = new Float64Array(nGeo), geoCatC = new Float64Array(nGeo);
+    const nV = new Float64Array(nN), nC = new Float64Array(nN), nCat = new Float64Array(nN), nCatC = new Float64Array(nN);
+    const skM = new Float64Array(nK), skC = new Float64Array(nK), skT = new Float64Array(nK), skP = new Float64Array(nK);
+    const skL = new Float64Array(nK), skU = new Float64Array(nK), skR = new Float64Array(nK), skG = new Float64Array(nK);
+    const P = D.P, N = D.N, GEO = D.Geo, K = D.K, U = D.U, R = D.R, Rk = D.Rk, S = D.S, PU = D.PU;
+    const DFa = D.DF || null, DSa = D.DS || null;
+    // части глубины промо строки: обычная цена той же строки × промо-штуки (после свёртки до ФО — готовые)
+    let dF = 0, dS = 0;
+    const depthOf = i => {
+      if (DFa) { dF = DFa[i]; dS = DSa[i]; return; }
+      const u = U[i], pu = PU[i], paid = promoRub(i), ru = u - pu, rr = R[i] + Rk[i] * 0.01 - paid;
+      if (pu > 0 && ru > 0 && rr > 0) { dF = rr / ru * pu; dS = dF - paid; } else { dF = 0; dS = 0; }
+    };
     for (let i = 0, n = P.length; i < n; i++) {
       const p = P[i], fl = pf[p];
       if (!fl) continue;
-      const f = F[i], net = N[i];
-      if (!netM[net] || !foM[f]) continue;
+      const net = N[i], g = GEO[i];
+      if (!netM[net] || !geoOk[g]) continue;
       const k = K[i];
       if (!catM[k]) continue;
-      const u = U[i], pr = prodOf[k], full = fullM[k];
-      catU_p[p] += u; prodU_p[p * nProd + pr] += u;
-      if (full) { selU_p[p] += u; selS_p[p] += S[i]; }
+      const tv = tOf(i), pv = pOf(i), lv = lOf(i), m = blk === 'T' ? tv : blk === 'P' ? pv : lv;
+      const pr = prodOf[k], full = fullM[k];
+      catM_p[p] += m; prodM_p[p * nProd + pr] += m;
+      if (full) { selM_p[p] += m; selS_p[p] += S[i]; }
       if (fl & 1) {
-        const r = R[i] + Rk[i] * 0.01, g = G[i], pu = PU[i];
-        catU += u; catR += r; catG += g; foCat[f] += u; nCat[net] += u;
-        prodU[pr] += u; prodPU[pr] += pu; prodDF[pr] += DF[i]; prodDS[pr] += DS[i];
+        const f = geoFo[g], br = bRof(i), bg = bGof(i);
+        depthOf(i);
+        catV += m; catR += br; catG += bg; foCat[f] += m; geoCat[g] += m; nCat[net] += m;
+        prodM[pr] += m; prodT[pr] += tv; prodP[pr] += pv; prodL[pr] += lv; prodDF[pr] += dF; prodDS[pr] += dS;
         if (full) {
-          const b = brandOf[k];
-          wU += u; wR += r; wPU += pu;
-          brU[b] += u; brR[b] += r; brG[b] += g; brPU[b] += pu; brS_p[p * nBrand + b] += S[i];
-          foU[f] += u; nU[net] += u; skU[k] += u; skR[k] += r; skPU[k] += pu;
+          const b = brandOf[k], bu = bUof(i);
+          wM += m; wT += tv; wP += pv; wL += lv; wU += bu; wR += br; wG += bg; wDF += dF; wDS += dS;
+          brM[b] += m; brT[b] += tv; brP[b] += pv; brL[b] += lv; brU[b] += bu; brR[b] += br; brG[b] += bg;
+          brDF[b] += dF; brDS[b] += dS; brS_p[p * nBrand + b] += S[i];
+          foV[f] += m; geoV[g] += m; nV[net] += m;
+          skM[k] += m; skT[k] += tv; skP[k] += pv; skL[k] += lv; skU[k] += bu; skR[k] += br; skG[k] += bg;
         }
       }
       if (fl & 2) {
-        cCatU += u; foCatC[f] += u; nCatC[net] += u;
+        const f = geoFo[g];
+        cmpCat += m; foCatC[f] += m; geoCatC[g] += m; nCatC[net] += m;
         if (full) {
-          cU += u; cR += R[i] + Rk[i] * 0.01; cPU += PU[i];
-          brC[brandOf[k]] += u; foC[f] += u; nC[net] += u; skC[k] += u;
+          depthOf(i);
+          cmpM += m; cmpT += tv; cmpP += pv; cmpL += lv; cmpU += bUof(i); cmpR += bRof(i); cmpG += bGof(i); cmpDF += dF; cmpDS += dS;
+          brC[brandOf[k]] += m; foC[f] += m; geoC[g] += m; nC[net] += m; skC[k] += m;
         }
       }
     }
-    const cP = D.cP, cN = D.cN, cF = D.cF, cS = D.cS;
-    for (let j = 0; j < cP.length; j++) {
-      const p = cP[j];
-      if ((pf[p] & 3) && netM[cN[j]] && foM[cF[j]]) catS_p[p] += cS[j];
+    const cPer = D.cP, cN = D.cN, cGeo = D.cGeo, cS = D.cS;
+    for (let j = 0; j < cPer.length; j++) {
+      const p = cPer[j];
+      if ((pf[p] & 3) && netM[cN[j]] && geoOk[cGeo[j]]) catS_p[p] += cS[j];
     }
     // TDP: среднее по неделям (месяцам) окна; знаменатель — магазины с продажами всей категории БП
     const tdpOver = (periods, stores, offset, stride) => {
@@ -592,50 +689,105 @@ footer p { margin: 4px 0; max-width: 1100px; }
     };
     const hasCmp = win.C.length > 0;
     const dShare = (a, b) => (hasCmp && ok(a) && ok(b) ? 100 * (a - b) : null);
+    const depth = (ds, df) => (df > 0 ? ds / df : null);
     const kpi = {
-      units: wU, unitsCmp: cU, rub: wR, rubCmp: cR,
-      share: div(wU, catU), shareCmp: div(cU, cCatU),
-      promo: div(wPU, wU), promoCmp: div(cPU, cU),
-      price: div(wR, wU), priceCmp: div(cR, cU),
+      sales: wM, salesCmp: cmpM, share: div(wM, catV), shareCmp: div(cmpM, cmpCat),
+      promoShare: div(wP, wT), promoShareCmp: div(cmpP, cmpT), loyalShare: div(wL, wT), loyalShareCmp: div(cmpL, cmpT),
+      price: div(wR, wU), priceCmp: div(cmpR, cmpU), priceKg: div(wR, wG), priceKgCmp: div(cmpR, cmpG),
+      depth: depth(wDS, wDF), depthCmp: depth(cmpDS, cmpDF),
       tdp: tdpOver(win.W, selS_p, 0, 1), tdpCmp: tdpOver(win.C, selS_p, 0, 1), hasCmp,
     };
     const chart1 = { axis, band: [axis.findIndex(a => a.o >= win.lo), axis.length - 1],
-      cur: axis.map(a => (a.p >= 0 ? selU_p[a.p] : null)),
-      ya: axis.map(a => (a.p >= 0 && per.pg[a.p] >= 0 ? selU_p[per.pg[a.p]] : null)) };
-    const prodRank = [...Array(nProd).keys()].filter(i => prodU[i] > 0).sort((a, b) => prodU[b] - prodU[a]);
+      cur: axis.map(a => (a.p >= 0 ? selM_p[a.p] : null)),
+      ya: axis.map(a => (a.p >= 0 && per.pg[a.p] >= 0 ? selM_p[per.pg[a.p]] : null)) };
+    const prodRank = [...Array(nProd).keys()].filter(i => prodM[i] > 0).sort((a, b) => prodM[b] - prodM[a]);
     const top5 = prodRank.slice(0, 5), top10 = prodRank.slice(0, 10);
     const chart2 = { series: top5.map(pr => ({ prod: pr,
-      values: axis.map(a => (a.p >= 0 && catU_p[a.p] > 0 ? prodU_p[a.p * nProd + pr] / catU_p[a.p] : null)) })) };
-    const chart3 = top10.map(pr => ({ prod: pr, share: div(prodU[pr], catU) }));
-    const chart4 = top10.map(pr => ({ prod: pr, promo: div(prodPU[pr], prodU[pr]),
-      depth: prodDF[pr] > 0 ? prodDS[pr] / prodDF[pr] : null }));
-    const brands = [], fos = [], nets = [], skus = [];
+      values: axis.map(a => (a.p >= 0 && catM_p[a.p] > 0 ? prodM_p[a.p * nProd + pr] / catM_p[a.p] : null)) })) };
+    const chart3 = top10.map(pr => ({ prod: pr, share: div(prodM[pr], catV) }));
+    const chart4 = top10.map(pr => ({ prod: pr, promoShare: div(prodP[pr], prodT[pr]), loyalShare: div(prodL[pr], prodT[pr]),
+      depth: depth(prodDS[pr], prodDF[pr]) }));
+    const brands = [], fos = [], regions = [], nets = [], skus = [];
     for (let b = 0; b < nBrand; b++) {
-      if (!brU[b] && !brC[b]) continue;
-      const share = div(brU[b], catU), shareCmp = div(brC[b], cCatU);
-      brands.push({ brand: b, units: brU[b], unitsCmp: brC[b], growth: growth(brU[b], brC[b]), share, shareCmp,
-        dShare: dShare(share, shareCmp), promo: div(brPU[b], brU[b]), price: div(brR[b], brU[b]),
+      if (!brM[b] && !brC[b]) continue;
+      const share = div(brM[b], catV), shareCmp = div(brC[b], cmpCat);
+      brands.push({ brand: b, sales: brM[b], salesCmp: brC[b], growth: growth(brM[b], brC[b]), share, shareCmp,
+        dShare: dShare(share, shareCmp), promoShare: div(brP[b], brT[b]), loyalShare: div(brL[b], brT[b]),
+        price: div(brR[b], brU[b]), priceKg: div(brR[b], brG[b]),
         index: brG[b] > 0 && catG > 0 && catR > 0 ? (brR[b] / brG[b]) / (catR / catG) : null,
-        tdp: tdpOver(win.W, brS_p, b, nBrand) });
+        depth: depth(brDS[b], brDF[b]), tdp: tdpOver(win.W, brS_p, b, nBrand) });
     }
-    for (let f = 0; f < nF; f++) {
-      if (!foCat[f] && !foCatC[f]) continue;
-      const share = div(foU[f], foCat[f]), shareCmp = div(foC[f], foCatC[f]);
-      fos.push({ fo: f, units: foU[f], unitsCmp: foC[f], growth: growth(foU[f], foC[f]), share, shareCmp, dShare: dShare(share, shareCmp) });
-    }
-    for (let n = 0; n < nN; n++) {
-      if (!nCat[n] && !nCatC[n]) continue;
-      const share = div(nU[n], nCat[n]), shareCmp = div(nC[n], nCatC[n]);
-      nets.push({ net: n, units: nU[n], unitsCmp: nC[n], growth: growth(nU[n], nC[n]), share, shareCmp, dShare: dShare(share, shareCmp) });
-    }
+    const geoRow = (v, c, cat, catC) => {
+      const share = div(v, cat), shareCmp = div(c, catC);
+      return { sales: v, salesCmp: c, growth: growth(v, c), share, shareCmp, dShare: dShare(share, shareCmp) };
+    };
+    for (let f = 0; f < nF; f++) if (foCat[f] || foCatC[f]) fos.push({ fo: f, ...geoRow(foV[f], foC[f], foCat[f], foCatC[f]) });
+    if (regionLevel) for (let g = 0; g < nGeo; g++) if (geoCat[g] || geoCatC[g]) regions.push({ geo: g, fo: geoFo[g], ...geoRow(geoV[g], geoC[g], geoCat[g], geoCatC[g]) });
+    for (let n = 0; n < nN; n++) if (nCat[n] || nCatC[n]) nets.push({ net: n, ...geoRow(nV[n], nC[n], nCat[n], nCatC[n]) });
     for (let k = 0; k < nK; k++) {
-      if (!skU[k] && !skC[k]) continue;
-      skus.push({ k, units: skU[k], unitsCmp: skC[k], growth: growth(skU[k], skC[k]), price: div(skR[k], skU[k]),
-        promo: div(skPU[k], skU[k]), share: div(skU[k], catU) });
+      if (!skM[k] && !skC[k]) continue;
+      skus.push({ k, sales: skM[k], salesCmp: skC[k], growth: growth(skM[k], skC[k]), share: div(skM[k], catV),
+        promoShare: div(skP[k], skT[k]), loyalShare: div(skL[k], skT[k]), price: div(skR[k], skU[k]), priceKg: div(skR[k], skG[k]) });
     }
-    const total = { units: wU, unitsCmp: cU, growth: growth(wU, cU), share: kpi.share, shareCmp: kpi.shareCmp,
+    const total = { sales: wM, salesCmp: cmpM, growth: growth(wM, cmpM), share: kpi.share, shareCmp: kpi.shareCmp,
       dShare: dShare(kpi.share, kpi.shareCmp) };
-    return { win, kpi, chart1, chart2, chart3, chart4, brands, fos, nets, skus, total };
+    return { win, kpi, chart1, chart2, chart3, chart4, brands, fos, regions, nets, skus, total };
+  }
+
+  // ---------- выгрузка в CSV для Excel: «;», десятичная запятая, UTF-8 с BOM ----------
+  const EXCEL_MAX = 1048575;
+  const r2 = (v, d) => (ok(v) ? Math.round(v * 10 ** d) / 10 ** d : null);
+  function csvCell(v) {
+    if (v == null || (typeof v === 'number' && !isFinite(v))) return '';
+    if (typeof v === 'number') return String(v).replace('.', ',');
+    const s = String(v);
+    return /[;"\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+  function saveCsv(name, parts) {
+    const url = URL.createObjectURL(new Blob(['\ufeff', ...parts], { type: 'text/csv;charset=utf-8' }));
+    const a = el('a', { href: url, download: name });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+  function fileName(kind) {
+    const span = SPANS.find(s => s[0] === state.span)[1];
+    return `X5_${META.contourName}_${kind}_${span}_${per.label[state.end]}.csv`.replace(/[\s\/\\:*?"<>|]+/g, '_');
+  }
+  // Строки данных за выбранный период со всеми срезами: неделя (месяц) × сеть × регион (ФО) × SKU
+  function detailCsv(st) {
+    const win = periodWindow(st), inW = new Uint8Array(nP);
+    for (const p of win.W) inW[p] = 1;
+    const { netM, geoOk, fullM } = masks(st);
+    const P = D.P, N = D.N, GEO = D.Geo, K = D.K;
+    let count = 0;
+    for (let i = 0; i < P.length; i++) if (inW[P[i]] && netM[N[i]] && geoOk[GEO[i]] && fullM[K[i]]) count++;
+    if (count > EXCEL_MAX) return { tooMany: count };
+    const head = ['Период', 'Начало', 'Конец', 'Сеть', 'ФО', ...(regionLevel ? ['Регион'] : []), 'PLU', 'SKU', 'Бренд',
+      'Производитель', 'Категория', 'Продажи, шт', 'Продажи, руб', 'Продажи, кг', 'Промо, шт', 'Промо, руб', 'Промо, кг',
+      'По картам, шт', 'По картам, руб', 'По картам, кг', 'Магазины с продажами'];
+    const cell = list => list.map(csvCell);
+    const perS = per.label.map((l, p) => cell([l, per.start[p], per.end[p]]).join(';'));
+    const netS = cell(META.nets), foS = cell(META.fos), regS = cell(META.regions), pluS = cell(META.products.plu);
+    const nameS = cell(META.products.name), brandS = cell(META.brands), prodS = cell(META.producers), catS = cell(META.categories);
+    const U = D.U, R = D.R, Rk = D.Rk, G = D.G, PU = D.PU, LU = D.LU, S = D.S;
+    const promoRub = measureOf('R', PU, D.PR, D.PRk), loyalRub = measureOf('R', LU, D.LR, D.LRk);
+    const promoKg = measureOf('G', PU, D.PR, D.PRk, D.PG), loyalKg = measureOf('G', LU, D.LR, D.LRk, D.LG);
+    const parts = [cell(head).join(';') + '\r\n'];
+    let chunk = [];
+    for (let i = 0; i < P.length; i++) {
+      const p = P[i], net = N[i], g = GEO[i], k = K[i];
+      if (!inW[p] || !netM[net] || !geoOk[g] || !fullM[k]) continue;
+      chunk.push([perS[p], netS[net], foS[geoFo[g]] + (regionLevel ? ';' + regS[g] : ''), pluS[k], nameS[k],
+        brandS[brandOf[k]], prodS[prodOf[k]], catS[catOf[k]],
+        csvCell(U[i]), csvCell(r2(R[i] + Rk[i] * 0.01, 2)), csvCell(r2(G[i] * 0.001, 3)),
+        csvCell(PU[i]), csvCell(r2(promoRub(i), 2)), csvCell(r2(promoKg(i), 3)),
+        csvCell(LU[i]), csvCell(r2(loyalRub(i), 2)), csvCell(r2(loyalKg(i), 3)), csvCell(S[i])].join(';'));
+      if (chunk.length === 20000) { parts.push(chunk.join('\r\n') + '\r\n'); chunk = []; }
+    }
+    if (chunk.length) parts.push(chunk.join('\r\n') + '\r\n');
+    return { parts, count };
   }
 
   // ---------- интерфейс: срезы ----------
@@ -645,59 +797,39 @@ footer p { margin: 4px 0; max-width: 1100px; }
     renderQueued = true;
     requestAnimationFrame(() => { renderQueued = false; renderAll(); });
   }
-  const openPanels = new Set();
-  document.addEventListener('pointerdown', e => {
-    for (const p of [...openPanels]) if (!p.wrap.contains(e.target)) p.close();
-  });
-  document.addEventListener('keydown', e => { if (e.key === 'Escape') for (const p of [...openPanels]) p.close(); });
-
-  function multiSelect(label, set, getOptions, onChange) {
-    const wrap = el('div', { class: 'ms' });
-    const val = el('span', { class: 'ms-val' });
-    const btn = el('button', { class: 'ms-btn', type: 'button', 'aria-haspopup': 'listbox', 'aria-expanded': 'false' },
-      el('span', { class: 'ms-label', text: label }), val, el('span', { 'aria-hidden': 'true', text: '▾' }));
-    const panel = el('div', { class: 'ms-panel', hidden: true, role: 'listbox', 'aria-multiselectable': 'true', 'aria-label': label });
+  // Список с галочками и поиском для боковой панели. «Все» — когда ничего не отмечено.
+  function filterList(label, set, getOptions, onChange) {
+    const count = el('span', { class: 'fl-count' });
+    const reset = el('button', { class: 'fl-reset', type: 'button', text: 'Сбросить' });
     const search = el('input', { class: 'ms-search', type: 'search', placeholder: 'Поиск', 'aria-label': `Поиск: ${label}` });
-    const list = el('div', { class: 'ms-list' });
-    panel.append(search, list);
-    wrap.append(btn, panel);
-    const api = { wrap, refresh, close };
-    function textOf(v) { const o = getOptions().find(x => x.value === v); return o ? o.text : String(v); }
-    function refresh() {
-      val.textContent = set.size === 0 ? 'Все' : set.size === 1 ? textOf([...set][0]) : `выбрано ${set.size}`;
-      btn.dataset.active = set.size > 0 ? 'true' : 'false';
-    }
+    const list = el('div', { class: 'ms-list', role: 'group', 'aria-label': label });
+    const wrap = el('section', { class: 'fl' }, el('div', { class: 'fl-head' }, el('span', { class: 'fl-title', text: label }), count, reset), search, list);
+    function head() { count.textContent = set.size ? `выбрано ${set.size}` : ''; reset.hidden = set.size === 0; }
     function fill() {
-      const q = search.value.trim().toLowerCase();
+      const all = getOptions(), q = search.value.trim().toLowerCase();
+      search.hidden = all.length <= 8;
       list.textContent = '';
       const allBox = el('input', { type: 'checkbox' });
       allBox.checked = set.size === 0;
-      allBox.addEventListener('change', () => { set.clear(); fill(); refresh(); onChange(); });
+      allBox.addEventListener('change', () => { set.clear(); refresh(); onChange(); });
       list.append(el('label', { class: 'ms-item ms-all' }, allBox, el('span', { text: 'Все' })));
-      for (const o of getOptions()) {
+      for (const o of all) {
         if (q && !o.text.toLowerCase().includes(q)) continue;
         const box = el('input', { type: 'checkbox' });
         box.checked = set.has(o.value);
         box.addEventListener('change', () => {
           if (box.checked) set.add(o.value); else set.delete(o.value);
           allBox.checked = set.size === 0;
-          refresh(); onChange();
+          head(); onChange();
         });
-        list.append(el('label', { class: 'ms-item' }, box, el('span', { text: o.text })));
+        list.append(el('label', { class: 'ms-item' + (o.own ? ' own' : '') }, box, el('span', { text: o.text })));
       }
     }
-    function open() {
-      for (const p of [...openPanels]) p.close();
-      search.value = '';
-      fill();
-      panel.hidden = false; btn.setAttribute('aria-expanded', 'true'); openPanels.add(api);
-      search.focus();
-    }
-    function close() { panel.hidden = true; btn.setAttribute('aria-expanded', 'false'); openPanels.delete(api); }
-    btn.addEventListener('click', () => (panel.hidden ? open() : close()));
+    function refresh() { fill(); head(); }
+    reset.addEventListener('click', () => { set.clear(); refresh(); onChange(); });
     search.addEventListener('input', fill);
     refresh();
-    return api;
+    return { wrap, refresh };
   }
 
   function productOk(k, useProds) {
@@ -705,15 +837,23 @@ footer p { margin: 4px 0; max-width: 1100px; }
     if (useProds && state.prods.size && !state.prods.has(prodOf[k])) return false;
     return true;
   }
+  // Списки производителей и брендов: свои первыми, дальше по алфавиту
+  const byName = (a, b) => a.text.localeCompare(b.text, 'ru');
   function availableProducers() {
     const seen = new Uint8Array(nProd);
     for (let k = 0; k < nK; k++) if (productOk(k, false)) seen[prodOf[k]] = 1;
-    return META.producers.map((t, i) => ({ value: i, text: t })).filter(o => seen[o.value]);
+    return META.producers.map((t, i) => ({ value: i, text: t, own: i === META.own })).filter(o => seen[o.value])
+      .sort((a, b) => b.own - a.own || byName(a, b));
   }
   function availableBrands() {
     const seen = new Uint8Array(nBrand);
     for (let k = 0; k < nK; k++) if (productOk(k, true)) seen[brandOf[k]] = 1;
-    return META.brands.map((t, i) => ({ value: i, text: t })).filter(o => seen[o.value]);
+    return META.brands.map((t, i) => ({ value: i, text: t, own: isOwnBrand(i) })).filter(o => seen[o.value])
+      .sort((a, b) => b.own - a.own || byName(a, b));
+  }
+  function availableRegions() {
+    return META.regions.map((t, i) => ({ value: i, text: t }))
+      .filter(o => state.fos.size === 0 || state.fos.has(geoFo[o.value])).sort(byName);
   }
   function prune(set, options) {
     const allowed = new Set(options.map(o => o.value));
@@ -721,11 +861,11 @@ footer p { margin: 4px 0; max-width: 1100px; }
   }
 
   const controls = {};
-  function segmented(label, options, get, set) {
+  function segmented(label, options, get, set, rerender = true) {
     const wrap = el('div', { class: 'seg', role: 'group', 'aria-label': label });
     const buttons = options.map(o => {
       const b = el('button', { type: 'button', text: o.text, title: o.title || null });
-      b.addEventListener('click', () => { set(o.value); refresh(); schedule(); });
+      b.addEventListener('click', () => { set(o.value); refresh(); if (rerender) schedule(); });
       return b;
     });
     function refresh() { buttons.forEach((b, i) => b.setAttribute('aria-pressed', String(get() === options[i].value))); }
@@ -733,8 +873,14 @@ footer p { margin: 4px 0; max-width: 1100px; }
     refresh();
     return { wrap, refresh };
   }
-  function buildFilters() {
-    const bar = el('div', { class: 'filters', role: 'region', 'aria-label': 'Срезы' });
+  const theme = () => document.documentElement.dataset.theme || 'light';
+  function setTheme(v) {
+    document.documentElement.dataset.theme = v;
+    try { localStorage.setItem('x5-theme', v); } catch (e) { /* без сохранения — тема просто не запомнится */ }
+  }
+  // Сверху: период, длина, сравнение, блок метрик, единица, тема
+  function buildTopbar() {
+    const bar = el('div', { class: 'filters', role: 'region', 'aria-label': 'Период и метрики' });
     const sel = el('select', { class: 'select', 'aria-label': weekly ? 'Неделя, которой заканчивается период' : 'Месяц, которым заканчивается период' });
     for (let p = nP - 1; p >= 0; p--) sel.append(el('option', { value: String(p), text: periodName(p) }));
     sel.addEventListener('change', () => { state.end = Number(sel.value); schedule(); });
@@ -744,43 +890,45 @@ footer p { margin: 4px 0; max-width: 1100px; }
     controls.span = segmented('Длина периода', SPANS.map(([value, text, title]) => ({ value, text, title })), () => state.span, v => { state.span = v; });
     controls.cmp = segmented('Сравнение', [{ value: 'YA', text: 'vs YA', title: 'С тем же периодом год назад' },
       { value: 'PP', text: 'vs PP', title: 'С предыдущим периодом той же длины' }], () => state.cmp, v => { state.cmp = v; });
-    controls.nets = multiSelect('Сеть', state.nets, () => META.nets.map((t, i) => ({ value: i, text: t })), schedule);
-    controls.fos = multiSelect('ФО', state.fos, () => META.fos.map((t, i) => ({ value: i, text: t })), schedule);
-    controls.cats = multiSelect('Категория', state.cats, () => META.categories.map((t, i) => ({ value: i, text: t })), () => {
+    controls.block = segmented('Блок метрик', BLOCKS.map(([value, text, , title]) => ({ value, text, title })), () => state.block, v => { state.block = v; });
+    controls.unit = segmented('Единица', MEASURES.map(([value, text, title]) => ({ value, text, title })), () => state.unit, v => { state.unit = v; });
+    controls.theme = segmented('Тема', [{ value: 'light', text: '☀ День', title: 'Дневная тема' }, { value: 'dark', text: '☾ Ночь', title: 'Ночная тема' }],
+      theme, setTheme, false);
+    const reset = el('button', { class: 'btn', type: 'button', text: 'Сбросить всё' });
+    reset.addEventListener('click', () => {
+      Object.assign(state, { end: nP - 1 }, DEFAULTS);
+      for (const k of ['nets', 'fos', 'regs', 'cats', 'prods', 'brands']) state[k].clear();
+      syncControls(); schedule();
+    });
+    bar.append(controls.end.wrap, controls.span.wrap, controls.cmp.wrap, controls.block.wrap, controls.unit.wrap,
+      el('span', { class: 'spacer' }), controls.theme.wrap, reset);
+    return bar;
+  }
+  // Сбоку: рынки (сеть, ФО, регион) и продукт (категория, производитель, бренд)
+  function buildSide() {
+    const side = el('aside', { class: 'side', 'aria-label': 'Срезы' });
+    controls.nets = filterList('Сеть', state.nets, () => META.nets.map((t, i) => ({ value: i, text: t })), schedule);
+    controls.fos = filterList('ФО', state.fos, () => META.fos.map((t, i) => ({ value: i, text: t })), () => {
+      if (regionLevel) { prune(state.regs, availableRegions()); controls.regs.refresh(); }
+      schedule();
+    });
+    if (regionLevel) controls.regs = filterList('Регион', state.regs, availableRegions, schedule);
+    controls.cats = filterList('Категория', state.cats, () => META.categories.map((t, i) => ({ value: i, text: t })), () => {
       prune(state.prods, availableProducers()); prune(state.brands, availableBrands());
       controls.prods.refresh(); controls.brands.refresh(); schedule();
     });
-    controls.prods = multiSelect('Производитель', state.prods, availableProducers, () => {
+    controls.prods = filterList('Производитель', state.prods, availableProducers, () => {
       prune(state.brands, availableBrands()); controls.brands.refresh(); schedule();
     });
-    controls.brands = multiSelect('Бренд', state.brands, availableBrands, schedule);
-    const reset = el('button', { class: 'btn', type: 'button', text: 'Сбросить' });
-    reset.addEventListener('click', () => {
-      Object.assign(state, { end: nP - 1 }, DEFAULTS);
-      for (const k of ['nets', 'fos', 'cats', 'prods', 'brands']) state[k].clear();
-      syncControls(); schedule();
-    });
-    bar.append(controls.end.wrap, controls.span.wrap, controls.cmp.wrap, controls.nets.wrap, controls.fos.wrap,
-      controls.cats.wrap, controls.prods.wrap, controls.brands.wrap, reset);
-    return bar;
+    controls.brands = filterList('Бренд', state.brands, availableBrands, schedule);
+    side.append(el('h3', { text: 'Рынок' }), controls.nets.wrap, controls.fos.wrap, ...(regionLevel ? [controls.regs.wrap] : []),
+      el('h3', { text: 'Продукт' }), controls.cats.wrap, controls.prods.wrap, controls.brands.wrap);
+    return side;
   }
   function syncControls() { for (const c of Object.values(controls)) c.refresh(); }
 
   // ---------- показатели ----------
-  const tiles = {};
-  function buildKpis() {
-    const box = el('section', { class: 'kpis', 'aria-label': 'Ключевые показатели' });
-    const defs = [
-      ['units', 'Продажи, шт'], ['rub', 'Продажи, руб'], ['share', 'Доля в категории, шт'],
-      ['promo', 'Доля промо, шт'], ['price', 'Цена за шт'], ['tdp', 'TDP средняя'],
-    ];
-    for (const [key, label] of defs) {
-      const value = el('div', { class: 'value', text: '—' }), delta = el('div', { class: 'delta' });
-      tiles[key] = { value, delta };
-      box.append(el('div', { class: 'tile' }, el('div', { class: 'label', text: label }), value, delta));
-    }
-    return box;
-  }
+  const kpiBox = el('section', { class: 'kpis', 'aria-label': 'Ключевые показатели' });
   function setDelta(node, d, tone) {
     node.textContent = '';
     if (!d) { node.className = 'delta none'; node.textContent = `к ${state.cmp}: нет данных`; return; }
@@ -790,20 +938,31 @@ footer p { margin: 4px 0; max-width: 1100px; }
   }
   const goodUp = up => (up ? 'good' : 'bad');
   const neutralTone = () => 'neutral';
+  const dPct = (a, b) => (ok(a) && ok(b) && b ? delta(a / b - 1, 'pct') : null);
+  const dPP = (a, b) => (ok(a) && ok(b) ? delta(100 * (a - b), 'pp') : null);
+  const KPI = {
+    sales: [() => `Продажи${bwSp()}, ${mu()}`, k => fmt.compact(k.sales), k => delta(growth(k.sales, k.salesCmp), 'pct'), goodUp],
+    share: [() => `Доля в категории${bw() ? ` (${bw()})` : ''}, ${mu()}`, k => fmt.pct(k.share), k => dPP(k.share, k.shareCmp), goodUp],
+    promoShare: [() => (state.block === 'P' ? `Доля промо в продажах, ${mu()}` : `Доля промо, ${mu()}`), k => fmt.pct(k.promoShare),
+      k => dPP(k.promoShare, k.promoShareCmp), neutralTone],
+    loyalShare: [() => (state.block === 'L' ? `Доля по картам в продажах, ${mu()}` : `Доля по картам, ${mu()}`), k => fmt.pct(k.loyalShare),
+      k => dPP(k.loyalShare, k.loyalShareCmp), neutralTone],
+    price: [() => `Цена${bwSp()} за шт`, k => fmt.rub(k.price), k => dPct(k.price, k.priceCmp), neutralTone],
+    priceKg: [() => `Цена${bwSp()} за кг/л`, k => fmt.rub(k.priceKg), k => dPct(k.priceKg, k.priceKgCmp), neutralTone],
+    depth: [() => 'Глубина промо', k => fmt.pct(k.depth), k => dPP(k.depth, k.depthCmp), neutralTone],
+    tdp: [() => 'TDP средняя', k => fmt.tdp(k.tdp), k => (ok(k.tdp) && ok(k.tdpCmp) ? delta(100 * (k.tdp - k.tdpCmp), 'pt') : null), goodUp],
+  };
+  const KPI_SETS = { T: ['sales', 'share', 'promoShare', 'loyalShare', 'price', 'priceKg', 'tdp'],
+    P: ['sales', 'share', 'promoShare', 'price', 'priceKg', 'depth'], L: ['sales', 'share', 'loyalShare', 'price', 'priceKg'] };
   function renderKpis(r) {
-    const k = r.kpi, c = k.hasCmp;
-    tiles.units.value.textContent = fmt.compact(k.units);
-    setDelta(tiles.units.delta, c ? delta(growth(k.units, k.unitsCmp), 'pct') : null, goodUp);
-    tiles.rub.value.textContent = fmt.compact(k.rub);
-    setDelta(tiles.rub.delta, c ? delta(growth(k.rub, k.rubCmp), 'pct') : null, goodUp);
-    tiles.share.value.textContent = fmt.pct(k.share);
-    setDelta(tiles.share.delta, c && ok(k.share) && ok(k.shareCmp) ? delta(100 * (k.share - k.shareCmp), 'pp') : null, goodUp);
-    tiles.promo.value.textContent = fmt.pct(k.promo);
-    setDelta(tiles.promo.delta, c && ok(k.promo) && ok(k.promoCmp) ? delta(100 * (k.promo - k.promoCmp), 'pp') : null, neutralTone);
-    tiles.price.value.textContent = fmt.rub(k.price);
-    setDelta(tiles.price.delta, c && ok(k.price) && ok(k.priceCmp) ? delta(k.price / k.priceCmp - 1, 'pct') : null, neutralTone);
-    tiles.tdp.value.textContent = fmt.tdp(k.tdp);
-    setDelta(tiles.tdp.delta, c && ok(k.tdp) && ok(k.tdpCmp) ? delta(100 * (k.tdp - k.tdpCmp), 'pt') : null, goodUp);
+    const k = r.kpi;
+    kpiBox.textContent = '';
+    for (const key of KPI_SETS[state.block]) {
+      const [label, value, change, tone] = KPI[key];
+      const d = el('div', { class: 'delta' });
+      setDelta(d, k.hasCmp ? change(k) : null, tone);
+      kpiBox.append(el('div', { class: 'tile' }, el('div', { class: 'label', text: label() }), el('div', { class: 'value', text: value(k) }), d));
+    }
   }
 
   // ---------- карточки и табличный вид ----------
@@ -813,10 +972,11 @@ footer p { margin: 4px 0; max-width: 1100px; }
     const tip = el('div', { class: 'tip', hidden: true, role: 'status' });
     const legend = el('div', { class: 'legend' });
     const toggle = el('button', { class: 'ghost', type: 'button', text: 'Таблица', 'aria-pressed': 'false' });
+    const h2 = el('h2', { text: title });
     const node = el('section', { class: 'card' },
-      el('div', { class: 'card-head' }, el('div', {}, el('h2', { text: title }), note ? el('div', { class: 'note', text: note }) : null), toggle),
+      el('div', { class: 'card-head' }, el('div', {}, h2, note ? el('div', { class: 'note', text: note }) : null), toggle),
       body, legend, table, tip);
-    const c = { node, body, table, tip, legend, toggle, rows: null, head: null, draw: null };
+    const c = { node, body, table, tip, legend, toggle, rows: null, head: null, draw: null, setTitle: s => { h2.textContent = s; } };
     toggle.addEventListener('click', () => {
       const show = table.hidden;
       table.hidden = !show; body.hidden = show; legend.hidden = show;
@@ -1004,48 +1164,73 @@ footer p { margin: 4px 0; max-width: 1100px; }
   }
 
   // ---------- таблицы ----------
+  // Вид колонки определяет и показ, и выгрузку: text, sales, pct (доля), dpct (прирост), pp (изменение доли), rub, idx, tdp
+  const titleOf = c => (typeof c.title === 'function' ? c.title() : c.title);
+  const scaled = (x, mul, d) => (ok(x) ? r2(x * mul, d) : null);
+  function exportColumns(c) {
+    const t = titleOf(c), v = r => r[c.key];
+    if (c.exp) return c.exp;
+    switch (c.kind) {
+      case 'sales': return [[t, r => scaled(v(r), 1, salesDigits())]];
+      case 'pct': case 'dpct': return [[t + ', %', r => scaled(v(r), 100, 2)]];
+      case 'pp': return [[t + ', п.п.', r => scaled(v(r), 1, 2)]];
+      case 'rub': return [[t + ', руб', r => scaled(v(r), 1, 2)]];
+      case 'idx': return [[t, r => scaled(v(r), 1, 3)]];
+      case 'tdp': return [[t, r => scaled(v(r), 100, 1)]];
+      default: return [[t, v]];
+    }
+  }
   function dataTable(title, note, columns, opts) {
     const wrapT = el('div', { class: 'table-wrap' });
     const more = el('button', { class: 'ghost more', type: 'button', hidden: true });
+    const csvBtn = el('button', { class: 'ghost', type: 'button', text: 'CSV', title: 'Скачать таблицу целиком для Excel' });
     const node = el('section', { class: 'card' + (opts.full ? ' full' : '') },
-      el('div', { class: 'card-head' }, el('div', {}, el('h2', { text: title }), note ? el('div', { class: 'note', text: note }) : null)), wrapT, more);
+      el('div', { class: 'card-head' }, el('div', {}, el('h2', { text: title }), note ? el('div', { class: 'note', text: note }) : null),
+        el('div', { class: 'card-actions' }, csvBtn)), wrapT, more);
     const t = { node, rows: [], total: null, sortKey: opts.sortKey, dir: -1, expanded: false };
     more.addEventListener('click', () => { t.expanded = !t.expanded; draw(); });
     function cellOf(col, row) {
+      if (col.render) return col.render(row);
       const v = row[col.key];
-      if (col.delta) {
-        const d = delta(v, col.delta);
+      if (col.kind === 'dpct' || col.kind === 'pp') {
+        const d = delta(v, col.kind === 'dpct' ? 'pct' : 'pp');
         if (!d) return el('td', { class: 'num none', text: '—' });
         if (!d.dir) return el('td', { class: 'num neutral', text: d.text });
         return el('td', { class: 'num ' + (d.dir > 0 ? 'good' : 'bad') }, el('span', { 'aria-hidden': 'true', text: d.dir > 0 ? '▲ ' : '▼ ' }), document.createTextNode(d.text));
       }
-      if (col.render) return col.render(row);
-      return el('td', { class: col.num ? 'num' : 'name', text: col.fmt ? col.fmt(v) : String(v) });
+      const f = { sales: fmt.sales, pct: fmt.pct, rub: fmt.rub, idx: fmt.idx, tdp: fmt.tdp }[col.kind];
+      return el('td', { class: f ? 'num' : 'name', text: f ? f(v) : String(v ?? '') });
+    }
+    const visible = () => columns.filter(c => !c.when || c.when());
+    function sortedRows() {
+      const col = visible().find(x => x.key === t.sortKey) || visible().find(x => x.kind === 'sales');
+      const val = r => { const v = r[col.key]; return ok(v) ? v : (typeof v === 'string' ? v : -Infinity); };
+      return [...t.rows].sort((a, b) => {
+        const x = val(a), y = val(b);
+        return (typeof x === 'string' ? x.localeCompare(y, 'ru') : x - y) * t.dir;
+      });
     }
     function draw() {
       wrapT.textContent = '';
       if (!t.rows.length) { wrapT.append(el('div', { class: 'empty', text: 'Нет данных для выбранных срезов' })); more.hidden = true; return; }
-      const col = columns.find(x => x.key === t.sortKey);
-      const val = r => { const v = col.sort ? col.sort(r) : r[col.key]; return ok(v) ? v : (typeof v === 'string' ? v : -Infinity); };
-      const rows = [...t.rows].sort((a, b) => {
-        const x = val(a), y = val(b);
-        return (typeof x === 'string' ? x.localeCompare(y, 'ru') : x - y) * t.dir;
-      });
+      const rows = sortedRows();
       const shown = t.expanded || !opts.limit ? rows : rows.slice(0, opts.limit);
       const table = el('table', { class: 'data' });
       const head = el('tr');
-      for (const cdef of columns) {
-        const th = el('th', { class: cdef.num ? 'num' : '', text: typeof cdef.title === 'function' ? cdef.title() : cdef.title, scope: 'col', tabindex: 0 });
+      const cols = visible();
+      for (const cdef of cols) {
+        const isNum = cdef.kind !== 'text';
+        const th = el('th', { class: isNum ? 'num' : '', text: titleOf(cdef), scope: 'col', tabindex: 0 });
         if (cdef.key === t.sortKey) th.setAttribute('aria-sort', t.dir > 0 ? 'ascending' : 'descending');
-        const sortBy = () => { if (t.sortKey === cdef.key) t.dir = -t.dir; else { t.sortKey = cdef.key; t.dir = cdef.num ? -1 : 1; } draw(); };
+        const sortBy = () => { if (t.sortKey === cdef.key) t.dir = -t.dir; else { t.sortKey = cdef.key; t.dir = isNum ? -1 : 1; } draw(); };
         th.addEventListener('click', sortBy);
         th.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); sortBy(); } });
         head.append(th);
       }
       table.append(el('thead', {}, head));
       const tb = el('tbody');
-      for (const r of shown) tb.append(el('tr', {}, ...columns.map(cdef => cellOf(cdef, r))));
-      if (t.total) tb.append(el('tr', { class: 'total' }, ...columns.map(cdef => cellOf(cdef, t.total))));
+      for (const r of shown) tb.append(el('tr', {}, ...cols.map(cdef => cellOf(cdef, r))));
+      if (t.total) tb.append(el('tr', { class: 'total' }, ...cols.map(cdef => cellOf(cdef, t.total))));
       table.append(tb);
       wrapT.append(table);
       if (opts.limit && rows.length > opts.limit) {
@@ -1053,90 +1238,131 @@ footer p { margin: 4px 0; max-width: 1100px; }
         more.textContent = t.expanded ? 'Свернуть' : `Показать все (${rows.length})`;
       } else more.hidden = true;
     }
+    t.csv = () => {
+      const cols = visible().flatMap(exportColumns);
+      const lines = [cols.map(c => csvCell(c[0])).join(';')];
+      for (const r of [...sortedRows(), ...(t.total ? [t.total] : [])]) lines.push(cols.map(c => csvCell(c[1](r))).join(';'));
+      return [lines.join('\r\n') + '\r\n'];
+    };
+    csvBtn.addEventListener('click', () => saveCsv(fileName(opts.file), t.csv()));
     t.set = (rows, total) => { t.rows = rows; t.total = total || null; draw(); };
     return t;
   }
 
   // ---------- сборка страницы ----------
   app.textContent = '';
-  const periodLine = el('div', { class: 'period', role: 'status' });
-  app.append(buildFilters(), periodLine, buildKpis());
+  const periodText = el('span');
+  const exportStatus = el('span', { class: 'status', role: 'status' });
+  const exportBtn = el('button', { class: 'ghost', type: 'button', text: 'Скачать данные',
+    title: `Строки по ${weekly ? 'неделям' : 'месяцам'}, сетям, ${regionLevel ? 'регионам' : 'ФО'} и SKU за выбранный период и срезы` });
+  exportBtn.addEventListener('click', () => {
+    exportStatus.textContent = 'Готовлю файл…';
+    setTimeout(() => {
+      const res = detailCsv(state);
+      if (res.tooMany) {
+        exportStatus.textContent = `Строк ${nf0.format(res.tooMany)} — больше, чем помещается на лист Excel. Сузьте период или срезы.`;
+        return;
+      }
+      saveCsv(fileName('данные'), res.parts);
+      exportStatus.textContent = `Выгружено строк: ${nf0.format(res.count)}`;
+    }, 30);
+  });
+  const periodLine = el('div', { class: 'period' }, periodText, el('span', { class: 'spacer' }), exportStatus, exportBtn);
+  const main = el('main', { class: 'main' });
+  app.append(buildTopbar(), el('div', { class: 'layout' }, buildSide(), main));
+  main.append(periodLine, kpiBox);
   const periodWord = weekly ? 'неделям' : 'месяцам';
   const lastWord = weekly ? 'Последние 52 недели' : 'Последние 12 месяцев';
-  const c1 = card(`Продажи, шт по ${periodWord}`, `${lastWord} и YA · выбранный период выделен фоном`);
-  const c2 = card(`Доля в категории по ${periodWord}: топ-5 производителей`, `${lastWord} · топ-5 за выбранный период · не зависит от срезов производителя и бренда`);
-  const c3 = card('Доля производителей в категории, шт', 'Топ-10 за выбранный период · не зависит от срезов производителя и бренда');
-  const c4 = card('Промо по производителям', 'Доля промо в продажах, шт и взвешенная глубина промо · топ-10 · без срезов производителя и бренда');
-  app.append(el('div', { class: 'grid2' }, c1.node, c2.node), el('div', { class: 'grid2' }, c3.node, c4.node));
+  const c1 = card('', `${lastWord} и YA · выбранный период выделен фоном`);
+  const c2 = card('', `${lastWord} · топ-5 за выбранный период · не зависит от срезов производителя и бренда`);
+  const c3 = card('', 'Топ-10 за выбранный период · не зависит от срезов производителя и бренда');
+  const c4 = card('', 'Топ-10 производителей · без срезов производителя и бренда');
+  main.append(el('div', { class: 'grid2' }, c1.node, c2.node), el('div', { class: 'grid2' }, c3.node, c4.node));
   const name = k => META.products.name[k];
   const ownMark = (text, own) => (own ? el('span', { class: 'own', text }) : document.createTextNode(text));
+  const salesTitle = () => `Продажи${bwSp()}, ${mu()}`;
+  const shareTitleCat = () => `Доля в категории${bw() ? ` (${bw()})` : ''}`;
   const growthTitle = () => `Прирост к ${state.cmp}`, shareTitle = () => `Изменение доли к ${state.cmp}`;
-  const tBrands = dataTable('Бренды', 'Доля и индекс цены — от категорий из среза «Категория» в тех же сетях, ФО и периоде', [
-    { key: 'name', title: 'Бренд', render: r => el('td', { class: 'name', title: r.name }, ownMark(r.name, r.own)) },
-    { key: 'units', title: 'Продажи, шт', num: true, fmt: fmt.int },
-    { key: 'growth', title: growthTitle, num: true, delta: 'pct' },
-    { key: 'share', title: 'Доля в категории', num: true, fmt: fmt.pct },
-    { key: 'dShare', title: shareTitle, num: true, delta: 'pp' },
-    { key: 'promo', title: 'Доля промо', num: true, fmt: fmt.pct },
-    { key: 'price', title: 'Цена за шт', num: true, fmt: fmt.rub },
-    { key: 'index', title: 'Индекс цены за кг', num: true, fmt: fmt.idx },
-    { key: 'tdp', title: 'TDP средняя', num: true, fmt: fmt.tdp },
-  ], { sortKey: 'units', limit: 20, full: true });
-  app.append(tBrands.node);
-  const geoColumns = label => [
-    { key: 'name', title: label },
-    { key: 'units', title: 'Продажи, шт', num: true, fmt: fmt.int },
-    { key: 'growth', title: growthTitle, num: true, delta: 'pct' },
-    { key: 'share', title: 'Доля в категории', num: true, fmt: fmt.pct },
-    { key: 'dShare', title: shareTitle, num: true, delta: 'pp' },
+  const promoCol = { key: 'promoShare', kind: 'pct', title: () => (state.block === 'P' ? 'Доля промо в продажах' : 'Доля промо'), when: () => state.block !== 'L' };
+  const loyalCol = { key: 'loyalShare', kind: 'pct', title: () => (state.block === 'L' ? 'Доля по картам в продажах' : 'Доля по картам'), when: () => state.block !== 'P' };
+  const priceCols = [{ key: 'price', kind: 'rub', title: () => `Цена${bwSp()} за шт` }, { key: 'priceKg', kind: 'rub', title: () => `Цена${bwSp()} за кг/л` }];
+  const tBrands = dataTable('Бренды', 'Доля и индекс цены — от категорий из среза «Категория» в тех же сетях, регионах и периоде', [
+    { key: 'name', kind: 'text', title: 'Бренд', render: r => el('td', { class: 'name', title: r.name }, ownMark(r.name, r.own)) },
+    { key: 'sales', kind: 'sales', title: salesTitle },
+    { key: 'growth', kind: 'dpct', title: growthTitle },
+    { key: 'share', kind: 'pct', title: shareTitleCat },
+    { key: 'dShare', kind: 'pp', title: shareTitle },
+    promoCol, loyalCol, ...priceCols,
+    { key: 'index', kind: 'idx', title: 'Индекс цены за кг' },
+    { key: 'depth', kind: 'pct', title: 'Глубина промо', when: () => state.block === 'P' },
+    { key: 'tdp', kind: 'tdp', title: 'TDP средняя', when: () => state.block === 'T' },
+  ], { sortKey: 'sales', limit: 20, full: true, file: 'бренды' });
+  main.append(tBrands.node);
+  const geoColumns = extra => [...extra,
+    { key: 'sales', kind: 'sales', title: salesTitle },
+    { key: 'growth', kind: 'dpct', title: growthTitle },
+    { key: 'share', kind: 'pct', title: shareTitleCat },
+    { key: 'dShare', kind: 'pp', title: shareTitle },
   ];
-  const tFo = dataTable('Федеральные округа', 'Доля — в категории своего округа', geoColumns('ФО'), { sortKey: 'units' });
-  const tNets = dataTable('Сети', 'Доля — в категории своей сети', geoColumns('Сеть'), { sortKey: 'units' });
-  const tSku = dataTable('SKU', 'Доля — в категориях из среза «Категория» в тех же сетях, ФО и периоде', [
-    { key: 'name', title: 'SKU', render: r => el('td', { class: 'name', title: `${r.name} · PLU ${r.plu}` }, document.createTextNode(r.name), el('span', { class: 'plu', text: r.plu })) },
-    { key: 'brandName', title: 'Бренд' },
-    { key: 'units', title: 'Продажи, шт', num: true, fmt: fmt.int },
-    { key: 'growth', title: growthTitle, num: true, delta: 'pct' },
-    { key: 'price', title: 'Цена за шт', num: true, fmt: fmt.rub },
-    { key: 'promo', title: 'Доля промо', num: true, fmt: fmt.pct },
-    { key: 'share', title: 'Доля в категории', num: true, fmt: fmt.pct },
-  ], { sortKey: 'units', limit: 20, full: true });
-  app.append(el('div', { class: 'grid2' }, tFo.node, tNets.node), tSku.node);
-  app.append(el('footer', {},
-    el('p', { text: 'Источник: X5 Dialog, отчёт «Анализ трендов», выгрузка из ClickHouse. Регионы сведены в федеральные округа.' }),
+  const tFo = dataTable('Федеральные округа', 'Доля — в категории своего округа', geoColumns([{ key: 'name', kind: 'text', title: 'ФО' }]),
+    { sortKey: 'sales', file: 'ФО' });
+  const tNets = dataTable('Сети', 'Доля — в категории своей сети', geoColumns([{ key: 'name', kind: 'text', title: 'Сеть' }]),
+    { sortKey: 'sales', file: 'сети' });
+  const tRegions = regionLevel ? dataTable('Регионы', 'Доля — в категории своего региона',
+    geoColumns([{ key: 'name', kind: 'text', title: 'Регион' }, { key: 'foName', kind: 'text', title: 'ФО' }]),
+    { sortKey: 'sales', limit: 20, full: true, file: 'регионы' }) : null;
+  const tSku = dataTable('SKU', 'Доля — в категориях из среза «Категория» в тех же сетях, регионах и периоде', [
+    { key: 'name', kind: 'text', title: 'SKU', exp: [['SKU', r => r.name], ['PLU', r => r.plu]],
+      render: r => el('td', { class: 'name', title: `${r.name} · PLU ${r.plu}` }, document.createTextNode(r.name), el('span', { class: 'plu', text: r.plu })) },
+    { key: 'brandName', kind: 'text', title: 'Бренд' },
+    { key: 'sales', kind: 'sales', title: salesTitle },
+    { key: 'growth', kind: 'dpct', title: growthTitle },
+    { key: 'share', kind: 'pct', title: shareTitleCat },
+    promoCol, { ...loyalCol, when: () => state.block === 'L' }, ...priceCols,
+  ], { sortKey: 'sales', limit: 20, full: true, file: 'SKU' });
+  main.append(el('div', { class: 'grid2' }, tFo.node, tNets.node), ...(tRegions ? [tRegions.node] : []), tSku.node);
+  main.append(el('footer', {},
+    el('p', { text: `Источник: X5 Dialog, отчёт «Анализ трендов», выгрузка из ClickHouse. ${regionLevel ? 'Данные по регионам X5, ФО — по справочнику регионов.' : 'Регионы сведены в федеральные округа.'}` }),
     el('p', { text: weekly
       ? 'Период задаётся последней неделей («До») и длиной: Нед — одна неделя; L4W и L13W — последние 4 и 13 недель; MTD, QTD и YTD — с начала месяца, квартала или года до выбранной недели, месяцы и кварталы по 4-4-5; MAT — последние 52 недели.'
       : 'Период задаётся последним месяцем («До») и длиной: Мес — один месяц; L3M — последние 3 месяца; QTD и YTD — с начала квартала или года до выбранного месяца; MAT — последние 12 месяцев.' }),
     el('p', { text: weekly
       ? 'YA — те же недели ISO годом раньше; у 53-й недели пары нет, это видно в строке периода. PP — столько же недель сразу перед выбранным периодом.'
       : 'YA — те же месяцы годом раньше. PP — столько же месяцев сразу перед выбранным периодом.' }),
-    el('p', { text: 'Доля в категории — продажи выбранного в штуках к продажам категорий из среза «Категория» в тех же сетях, ФО и периоде; срезы производителя и бренда на знаменатель не влияют. В таблицах ФО и сетей доля считается внутри своего округа или своей сети. Изменение доли — в процентных пунктах к периоду сравнения.' }),
+    el('p', { text: 'Блоки метрик как в X5: Тотал — все продажи, Промо — продажи по промо, Лояльные — продажи покупателям с картами лояльности X5. Продажи, доли в категории, прирост и цены считаются внутри выбранного блока: например, в блоке «Промо» доля в категории — промо-продажи бренда к промо-продажам категории. Доля промо и доля по картам — от всех продаж. Единица — штуки, рубли или килограммы (литры).' }),
+    el('p', { text: 'Доля в категории — продажи выбранного к продажам категорий из среза «Категория» в тех же сетях, регионах и периоде; срезы производителя и бренда на знаменатель не влияют. В таблицах ФО, регионов и сетей доля считается внутри своего округа, региона или сети. Изменение доли — в процентных пунктах к периоду сравнения.' }),
     el('p', { text: 'Взвешенная глубина промо — на сколько промо-цена ниже обычной цены тех же SKU в той же сети, регионе и периоде, взвешено по промо-штукам. Строки, где SKU продавался только по промо, пропускаются.' }),
     el('p', { text: `TDP — сумма нумерических дистрибуций SKU в пунктах: для каждого SKU берётся доля магазинов с его продажами среди магазинов с продажами всей категории БП, в процентах, и доли складываются. TDP 250 — в среднем 2,5 SKU в магазине. TDP средняя — среднее по ${periodWord} периода. Магазин засчитывается, только если в нём была продажа. В Excel та же мера показана в процентах: 250% там — это 250 здесь.` }),
-    el('p', { text: 'Индекс цены за кг — цена за кг бренда к цене за кг категории; 1,00 — на уровне категории. Чеки, покупатели и взвешенная дистрибуция здесь не показаны: для брендов из данных X5 их честно не посчитать.' }),
+    el('p', { text: 'Индекс цены за кг — цена за кг бренда к цене за кг категории в том же блоке; 1,00 — на уровне категории. Чеки, покупатели и взвешенная дистрибуция здесь не показаны: для брендов из данных X5 их честно не посчитать.' }),
+    el('p', { text: `Выгрузка: кнопка CSV у таблицы сохраняет её целиком, «Скачать данные» — строки по ${periodWord}, сетям, ${regionLevel ? 'регионам' : 'ФО'} и SKU за выбранный период и срезы со всеми метриками. Файлы открываются в Excel: разделитель «;», десятичная запятая.` }),
     el('p', { id: 'perf', class: 'sub' })));
 
   function renderPeriod(win) {
     const spanText = SPANS.find(s => s[0] === state.span)[1];
     const range = ps => (!ps.length ? 'нет данных' : ps.length === 1 ? per.label[ps[0]] : `${per.label[ps[0]]} – ${per.label[ps[ps.length - 1]]}`);
-    periodLine.textContent = '';
-    periodLine.append(el('b', { text: spanText }), document.createTextNode(` · ${range(win.W)} · ${win.W.length} ${UNIT} · ${state.cmp}: ${range(win.C)}`));
+    periodText.textContent = '';
+    periodText.append(el('b', { text: spanText }), document.createTextNode(` · ${range(win.W)} · ${win.W.length} ${UNIT} · ${state.cmp}: ${range(win.C)}`));
     const warn = [];
     if (win.missing > 0) warn.push(`в периоде нет данных за ${win.missing} ${UNIT}`);
     if (win.cmpMissing > 0) warn.push(state.cmp === 'YA' ? `у ${win.cmpMissing} ${UNIT} нет пары в YA` : `в PP нет данных за ${win.cmpMissing} ${UNIT}`);
-    if (warn.length) periodLine.append(el('span', { class: 'warn', text: ' · ⚠ ' + warn.join(', ') }));
+    if (warn.length) periodText.append(el('span', { class: 'warn', text: ' · ⚠ ' + warn.join(', ') }));
+    exportStatus.textContent = '';
   }
 
   let last = null;
   function drawCharts(r) {
-    const ax = r.chart1.axis, labels = ax.map(axisLabel);
+    const ax = r.chart1.axis, labels = ax.map(axisLabel), u = mu(), b = bw();
     const xLabel = i => labels[i].short;
     const tipTitle = i => labels[i].long;
     const bandLabel = SPANS.find(s => s[0] === state.span)[1];
-    c1.rows = ax.map((a, i) => [labels[i].long, fmt.int(r.chart1.cur[i]), fmt.int(r.chart1.ya[i])]);
-    c1.head = ['Период', 'Продажи, шт', 'YA, шт'];
+    const inner = b ? `${b}, ${u}` : u;
+    c1.setTitle(`Продажи${bwSp()}, ${u} по ${periodWord}`);
+    c2.setTitle(`Доля в категории (${inner}) по ${periodWord}: топ-5 производителей`);
+    c3.setTitle(`Доля производителей в категории (${inner})`);
+    c1.rows = ax.map((a, i) => [labels[i].long, fmt.sales(r.chart1.cur[i]), fmt.sales(r.chart1.ya[i])]);
+    c1.head = ['Период', `Продажи${bwSp()}, ${u}`, `YA, ${u}`];
     lineChart(c1, { labels, xLabel, tipTitle, band: r.chart1.band, bandLabel, fmt: fmt.compact, axisFmt: v => fmt.compact(v), sortTip: false,
-      aria: `Продажи в штуках по ${periodWord} и YA`,
+      aria: `Продажи${bwSp()} (${u}) по ${periodWord} и YA`,
       series: [{ name: 'Продажи', color: 'var(--s1)', values: r.chart1.cur }, { name: 'YA', color: 'var(--other)', values: r.chart1.ya }] });
     c2.rows = ax.map((a, i) => [labels[i].long, ...r.chart2.series.map(s => fmt.pct(s.values[i]))]);
     c2.head = ['Период', ...r.chart2.series.map(s => META.producers[s.prod])];
@@ -1146,17 +1372,28 @@ footer p { margin: 4px 0; max-width: 1100px; }
       aria: 'Доля производителей в категории по периодам',
       series: r.chart2.series.map(s => ({ name: META.producers[s.prod], color: prodColor(s.prod), values: s.values })) });
     c3.rows = r.chart3.map(x => [META.producers[x.prod], fmt.pct(x.share)]);
-    c3.head = ['Производитель', 'Доля в категории, шт'];
-    barChart(c3, { fmt: fmt.pct, series: [{ name: 'Доля в категории, шт', color: 'var(--other)' }],
+    c3.head = ['Производитель', `Доля в категории (${inner})`];
+    barChart(c3, { fmt: fmt.pct, series: [{ name: `Доля в категории (${inner})`, color: 'var(--other)' }],
       rows: r.chart3.map(x => ({ label: META.producers[x.prod], values: [x.share], own: x.prod === META.own,
         colors: [x.prod === META.own ? 'var(--s1)' : 'var(--other)'] })),
       legend: META.own >= 0 ? [{ name: META.producers[META.own], color: 'var(--s1)' }, { name: 'Другие производители', color: 'var(--other)' }] : null });
-    c4.rows = r.chart4.map(x => [META.producers[x.prod], fmt.pct(x.promo), fmt.pct(x.depth)]);
-    c4.head = ['Производитель', 'Доля промо, шт', 'Глубина промо'];
-    barChart(c4, { fmt: fmt.pct, series: [{ name: 'Доля промо, шт', color: 'var(--s1)' }, { name: 'Глубина промо, взвешенная', color: 'var(--s2)' }],
-      rows: r.chart4.map(x => ({ label: META.producers[x.prod], values: [x.promo, x.depth], own: x.prod === META.own })) });
+    if (state.block === 'L') {
+      c4.setTitle('Доля по картам по производителям');
+      c4.rows = r.chart4.map(x => [META.producers[x.prod], fmt.pct(x.loyalShare)]);
+      c4.head = ['Производитель', `Доля по картам в продажах, ${u}`];
+      barChart(c4, { fmt: fmt.pct, series: [{ name: `Доля по картам в продажах, ${u}`, color: 'var(--s3)' }],
+        rows: r.chart4.map(x => ({ label: META.producers[x.prod], values: [x.loyalShare], own: x.prod === META.own })),
+        legend: [{ name: `Доля по картам в продажах, ${u}`, color: 'var(--s3)' }] });
+    } else {
+      c4.setTitle('Промо по производителям');
+      c4.rows = r.chart4.map(x => [META.producers[x.prod], fmt.pct(x.promoShare), fmt.pct(x.depth)]);
+      c4.head = ['Производитель', `Доля промо в продажах, ${u}`, 'Глубина промо'];
+      barChart(c4, { fmt: fmt.pct, series: [{ name: `Доля промо в продажах, ${u}`, color: 'var(--s1)' }, { name: 'Глубина промо, взвешенная', color: 'var(--s2)' }],
+        rows: r.chart4.map(x => ({ label: META.producers[x.prod], values: [x.promoShare, x.depth], own: x.prod === META.own })) });
+    }
     for (const c of [c1, c2, c3, c4]) if (!c.table.hidden) fillTable(c);
   }
+  const tables = () => ({ brands: tBrands, fos: tFo, nets: tNets, regions: tRegions, skus: tSku });
   function renderAll() {
     const t0 = performance.now();
     const r = compute(state);
@@ -1167,20 +1404,23 @@ footer p { margin: 4px 0; max-width: 1100px; }
     tBrands.set(r.brands.map(b => ({ ...b, name: META.brands[b.brand], own: isOwnBrand(b.brand) })));
     tFo.set(r.fos.map(f => ({ ...f, name: META.fos[f.fo] })), { ...r.total, name: 'Итого' });
     tNets.set(r.nets.map(x => ({ ...x, name: META.nets[x.net] })), { ...r.total, name: 'Итого' });
+    if (tRegions) tRegions.set(r.regions.map(x => ({ ...x, name: META.regions[x.geo], foName: META.fos[x.fo] })), { ...r.total, name: 'Итого', foName: '' });
     tSku.set(r.skus.map(s => ({ ...s, name: name(s.k), plu: META.products.plu[s.k], brandName: META.brands[brandOf[s.k]] })));
     document.getElementById('perf').textContent = `Строк данных: ${nf0.format(D.P.length)} · пересчёт ${Math.round(performance.now() - t0)} мс`;
     document.body.dataset.ready = '1';
   }
   let resizeTimer = 0;
-  new ResizeObserver(() => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => last && drawCharts(last), 120); }).observe(app);
+  new ResizeObserver(() => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => last && drawCharts(last), 120); }).observe(main);
   window.X5 = {
-    meta: META, state, compute, periodWindow,
+    meta: META, state, compute, periodWindow, fileName, setTheme,
     set(patch) {
       for (const [k, v] of Object.entries(patch)) state[k] = v instanceof Array ? new Set(v) : v;
       syncControls();
       renderAll();
       return last;
     },
+    tableCsv: name => tables()[name].csv().join(''),
+    detailCsv: () => { const res = detailCsv(state); return res.tooMany ? { tooMany: res.tooMany } : { count: res.count, text: res.parts.join('') }; },
   };
   renderAll();
 })();
