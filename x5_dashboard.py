@@ -90,12 +90,17 @@ def build(contour):
     cal["НачалоПериодаПГ"] = pd.to_datetime(cal["НачалоПериодаПГ"], errors="coerce")
     for c in ["Год", "Месяц", "Квартал"] + (["Неделя"] if weekly else []):
         cal[c] = cal[c].astype(int)
-    # Сквозной номер периода: по нему считаются скользящие окна (L4W, MAT) и PP, пропуски в данных окна не сдвигают
+    # Сквозной номер периода: по нему считаются скользящие окна (L4W, MAT) и PP.
+    # Недели: каждая неделя из данных — следующий номер, пропуск в данных — столько номеров, сколько недель прошло.
     if weekly:
-        days = (cal["НачалоПериода"] - pd.Timestamp("2000-01-03")).dt.days   # 2000-01-03 — понедельник
-        if (days % 7 != 0).any():
-            raise SystemExit("СТОП. В недельном календаре есть недели, которые начинаются не с понедельника.")
-        cal["Номер"] = days // 7
+        gap = cal["НачалоПериода"].diff().dt.days
+        cal["Номер"] = (gap / 7).round().clip(lower=1).fillna(0).cumsum().astype(int)
+        odd = cal[cal["НачалоПериода"].dt.dayofweek != 0]
+        if len(odd):
+            day = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+            print(f"  Недель не с понедельника: {len(odd)} из {len(cal)}, например: " + "; ".join(
+                f"{s:%d.%m.%Y} ({day[s.dayofweek]}) – {e:%d.%m.%Y} ({day[e.dayofweek]})"
+                for s, e in zip(odd["НачалоПериода"].head(6), odd["КонецПериода"].head(6))))
     else:
         cal["Номер"] = cal["Год"] * 12 + cal["Месяц"] - 1
     if START_YEAR:
@@ -470,16 +475,15 @@ footer p { margin: 4px 0; max-width: 1100px; }
        ['YTD', 'YTD', 'С начала года до выбранного месяца'], ['MAT', 'MAT', 'Последние 12 месяцев']];
   const ROLL = { P: 1, L4: 4, L13: 13, L3: 3, MAT: weekly ? 52 : 12 };
   const CHART_LEN = weekly ? 52 : 12, UNIT = weekly ? 'нед.' : 'мес.';
-  const DAY = 86400000, EPOCH = Date.UTC(2000, 0, 3);   // понедельник, от него идёт сквозной номер недели
-  const dm = ms => { const d = new Date(ms); return String(d.getUTCDate()).padStart(2, '0') + '.' + String(d.getUTCMonth() + 1).padStart(2, '0'); };
-  function axisLabel(o) {
+  // Подпись точки оси: неделя — из календаря (пропуск в данных без подписи), месяц — из сквозного номера
+  function axisLabel(a) {
     if (weekly) {
-      const ms = EPOCH + o * 7 * DAY, th = new Date(ms + 3 * DAY), y = th.getUTCFullYear();
-      const w = 1 + Math.floor((th.getTime() - Date.UTC(y, 0, 1)) / DAY / 7);
-      return { short: 'Н' + w, long: `Неделя ${w} ${y} (${dm(ms)}–${dm(ms + 6 * DAY)})` };
+      if (a.p < 0) return { short: '', long: 'Нет данных за эту неделю' };
+      const p = a.p;
+      return { short: 'Н' + per.num[p], long: `Неделя ${per.num[p]} ${per.year[p]} (${per.start[p].slice(0, 5)}–${per.end[p].slice(0, 5)})` };
     }
-    const y = Math.floor(o / 12), mo = o - y * 12;
-    return { short: mo === 0 ? `${MON3[0]} ${String(y).slice(2)}` : MON3[mo], long: `${MONTHS[mo]} ${y}` };
+    const y = Math.floor(a.o / 12), mo = a.o - y * 12;
+    return { short: mo === 0 ? `${MON3[0]} ${String(y).slice(2)}` : MON3[mo], long: `${MONTHS[mo]} ${y}` + (a.p < 0 ? ' · нет данных' : '') };
   }
   const periodName = p => (weekly ? `${per.label[p]} · ${per.start[p].slice(0, 5)}–${per.end[p].slice(0, 5)}`
     : `${MONTHS[per.month[p] - 1]} ${per.year[p]}`);
@@ -1125,9 +1129,9 @@ footer p { margin: 4px 0; max-width: 1100px; }
 
   let last = null;
   function drawCharts(r) {
-    const ax = r.chart1.axis, labels = ax.map(a => axisLabel(a.o));
+    const ax = r.chart1.axis, labels = ax.map(axisLabel);
     const xLabel = i => labels[i].short;
-    const tipTitle = i => labels[i].long + (ax[i].p < 0 ? ' · нет данных' : '');
+    const tipTitle = i => labels[i].long;
     const bandLabel = SPANS.find(s => s[0] === state.span)[1];
     c1.rows = ax.map((a, i) => [labels[i].long, fmt.int(r.chart1.cur[i]), fmt.int(r.chart1.ya[i])]);
     c1.head = ['Период', 'Продажи, шт', 'YA, шт'];
