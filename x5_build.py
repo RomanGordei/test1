@@ -7,7 +7,8 @@
   1. Читает x5_weekly.parquet и x5_monthly.parquet, выгруженные из клика скриптом x5_export.py.
   2. Переименовывает колонки ПО СОДЕРЖИМОМУ: в клике 15 колонок названы не тем, что в них лежит.
   3. Проверяет формулы X5 на каждой строке и останавливается, если колонки в клике поменялись.
-  4. Делит данные на факты по PLU и итоги категории (строки TOTAL), убирает полные дубли, проверяет баланс.
+  4. Делит данные на факты по PLU и итоги категории (строки TOTAL), убирает полные дубли,
+     склеивает периоды, которые X5 прислал частями (37-я неделя 2026), проверяет баланс.
   5. Собирает справочники и календари (недели разложены по месяцам 4-4-5), пишет build_report.txt.
 
 Результат: CSV для Power Query в Excel (разделитель «;», десятичная запятая, UTF-8).
@@ -141,6 +142,33 @@ def read_source(name):
     return df[keep + BASE_COLS]
 
 
+def merge_split_periods(df, weekly):
+    """X5 иногда режет период на части: 37-я неделя 2026 пришла как 07.09 (1 день) и 08–13.09.
+    Части одной недели (месяца) склеиваются в один период: продажи, чеки и покупатели складываются,
+    магазины и взвешенная дистрибуция берутся по большей части, дни продаж — через магазино-дни."""
+    reach = ["TOTAL_Магазины", "PROMO_Магазины", "TOTAL_ВзвДистр"]   # охват по частям не складывается
+    start = df["НачалоПериода"].dt.to_period("W-SUN" if weekly else "M").dt.start_time
+    parts = df[["НачалоПериода", "КонецПериода"]].assign(Начало=start).drop_duplicates()
+    split = parts[parts.duplicated("Начало", keep=False)].sort_values("НачалоПериода")
+    if split.empty:
+        return df
+    for begin, p in split.groupby("Начало"):
+        pieces = ", ".join(f"{s:%d.%m}–{e:%d.%m.%Y}" for s, e in zip(p["НачалоПериода"], p["КонецПериода"]))
+        log(f"  ! период пришёл частями: {pieces} -> склеен в {begin:%d.%m}–{p['КонецПериода'].max():%d.%m.%Y}; "
+            f"магазины, взвешенная дистрибуция и покупатели в нём оценочные")
+    rows = df["НачалоПериода"].isin(split["НачалоПериода"])
+    part = df[rows].sort_values("НачалоПериода")
+    part = part.assign(НачалоПериода=start.loc[part.index],
+                       ДниМагазинов=part["TOTAL_Магазины"] * part["TOTAL_ДнейПродаж"])
+    g = part.groupby(["НачалоПериода", "Сеть", "Регион", "PLU", "ЭтоИтог"], sort=False)
+    plain = [c for c in BASE_COLS if c not in reach and c != "TOTAL_ДнейПродаж"] + ["ДниМагазинов"]
+    merged = pd.concat([g[plain].sum(min_count=1), g[reach].max(), g[["КонецПериода"]].max(),
+                        g[["Период", "ФО", "ГруппаТоваров"]].first()], axis=1).reset_index()
+    stores = merged["TOTAL_Магазины"].where(merged["TOTAL_Магазины"] > 0)
+    merged["TOTAL_ДнейПродаж"] = (merged.pop("ДниМагазинов") / stores).round()
+    return pd.concat([df[~rows], merged[df.columns]], ignore_index=True)
+
+
 def load_contour(name):
     """Факты по PLU и итоги категории (строки TOTAL) одного контура плюс проверки дублей и баланса."""
     df = read_source(name)
@@ -172,6 +200,7 @@ def load_contour(name):
         raise SystemExit(f"СТОП. {RAW[name].name}: разные строки с одним ключом период × сеть × регион × PLU: "
                          f"{int(clash.sum())}. Например:\n{ex.to_string(index=False)}")
 
+    df = merge_split_periods(df, weekly=(name == "weekly"))
     fact = df[~df["ЭтоИтог"]].drop(columns="ЭтоИтог").reset_index(drop=True)
     cat = df[df["ЭтоИтог"]].drop(columns=["ЭтоИтог", "PLU", "ГруппаТоваров"]).reset_index(drop=True)
 
