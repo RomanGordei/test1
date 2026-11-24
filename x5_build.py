@@ -12,6 +12,7 @@
 
 Результат: CSV для Power Query в Excel (разделитель «;», десятичная запятая, UTF-8).
 """
+import datetime as dt
 import re
 from pathlib import Path
 
@@ -27,6 +28,13 @@ CLASSIFIER = BASE / "Справочники" / "X5_Products.xlsx"   # твой �
 SHOPS = BASE / "Справочники" / "shop_tree.xlsx"          # гео-справочник с портала
 OUT = BASE / "Cube"
 MAX_BAD_SHARE = 0.01   # доля строк с нарушенной формулой, после которой сборка останавливается
+
+# Поля, которые попадают в куб. Остальные колонки классификатора и гео-справочника остаются только в самих файлах.
+# Чтобы вернуть поле в куб, допиши его название в список.
+PRODUCT_COLS = ["PLU", "Название", "Группа товаров", "Категория", "Происхождение", "Способ приготовления",
+                "Производитель (корректный)", "Бренд (корректный)", "Продуктовая линия", "Внешние параметры",
+                "Вид упаковки", "Вес нетто (абс.)", "Вес (интерв.)", "Вес (сортировка)"]
+REGION_COLS = ["Регион", "ФО"]
 
 # ---------------- КОЛОНКИ КЛИКА ----------------
 # Таблицы x5.x5 (недели) и x5.x5_month (месяцы). 15 колонок в клике названы не тем, что в них лежит.
@@ -204,6 +212,13 @@ def build_calendar(fact, weekly):
     cal = cal.rename(columns={"Месяц445": "Месяц"})
     cal["Квартал"] = (cal["Месяц"] - 1) // 3 + 1
     cal["МесяцМетка"] = cal["Год"].astype(str) + "-" + cal["Месяц"].astype(str).str.zfill(2)
+    # Начало того же периода год назад: та же неделя ISO (у 53-й недели пары нет) или тот же месяц
+    if weekly:
+        weeks_in = lambda year: dt.date(year, 12, 28).isocalendar()[1]
+        cal["НачалоПериодаПГ"] = [pd.Timestamp(dt.date.fromisocalendar(y - 1, w, 1)) if w <= weeks_in(y - 1) else pd.NaT
+                                  for y, w in zip(cal["Год"], cal["Неделя"])]
+    else:
+        cal["НачалоПериодаПГ"] = cal["НачалоПериода"] - pd.DateOffset(years=1)
     return cal.reset_index(drop=True)
 
 
@@ -236,7 +251,10 @@ def build_products(facts):
         cls.loc[cls["Размечен"] == "нет", own] = "Не размечено"
     cls["Вес нетто (абс.)"] = to_num(cls["Вес нетто (абс.)"])
     cls["Вес (сортировка)"] = cls["Вес (интерв.)"].map(weight_sort)
-    return cls
+    missing = [c for c in PRODUCT_COLS if c not in cls.columns]
+    if missing:
+        raise SystemExit(f"СТОП. В классификаторе нет колонок {missing}: проверь названия или поправь PRODUCT_COLS.")
+    return cls[PRODUCT_COLS]
 
 
 def build_regions(facts):
@@ -251,7 +269,7 @@ def build_regions(facts):
     reg = reg.merge(codes, on="Регион", how="left").fillna("")
     log(f"  регионов {len(reg)}, федеральных округов {reg['ФО'].nunique()}; "
         f"регионов без кода субъекта: {int((reg['КодСубъекта'] == '').sum())}")
-    return reg.sort_values(["ФО", "Регион"]).reset_index(drop=True)
+    return reg.sort_values(["ФО", "Регион"])[REGION_COLS].reset_index(drop=True)
 
 
 def save(df, name):

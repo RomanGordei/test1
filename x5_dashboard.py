@@ -1,7 +1,7 @@
 """Автономный HTML-дашборд X5 Dialog по файлам куба.
 
 Запуск:  python x5_dashboard.py   (после x5_build.py)
-Нужно:   pandas и numpy (уже стоят для x5_build.py)
+Нужно:   pip install pandas numpy
 
 Что делает:
   1. Читает CSV куба (факты, итоги категории, календарь, продукты, регионы).
@@ -85,10 +85,19 @@ def build(contour):
     weekly = contour == "weekly"
 
     cal = read(f"x5_{contour}_calendar", dtype=str)
-    cal["НачалоПериода"] = pd.to_datetime(cal["НачалоПериода"])
+    for c in ["НачалоПериода", "КонецПериода"]:
+        cal[c] = pd.to_datetime(cal[c])
     cal["НачалоПериодаПГ"] = pd.to_datetime(cal["НачалоПериодаПГ"], errors="coerce")
-    for c in ["Год", "Месяц"] + (["Неделя"] if weekly else []):
+    for c in ["Год", "Месяц", "Квартал"] + (["Неделя"] if weekly else []):
         cal[c] = cal[c].astype(int)
+    # Сквозной номер периода: по нему считаются скользящие окна (L4W, MAT) и PP, пропуски в данных окна не сдвигают
+    if weekly:
+        days = (cal["НачалоПериода"] - pd.Timestamp("2000-01-03")).dt.days   # 2000-01-03 — понедельник
+        if (days % 7 != 0).any():
+            raise SystemExit("СТОП. В недельном календаре есть недели, которые начинаются не с понедельника.")
+        cal["Номер"] = days // 7
+    else:
+        cal["Номер"] = cal["Год"] * 12 + cal["Месяц"] - 1
     if START_YEAR:
         cal = cal[cal["Год"] >= START_YEAR]
     cal = cal.sort_values("НачалоПериода").reset_index(drop=True)
@@ -96,7 +105,6 @@ def build(contour):
     pg = cal["НачалоПериодаПГ"].map(per_index).fillna(-1).astype(int)
 
     regions = read("x5_regions", dtype=str).fillna("")
-    regions["ФО"] = regions["ФО"].replace("", "Не указан")
     reg_fo = dict(zip(regions["Регион"], regions["ФО"]))
     products = read("x5_products", dtype=str).fillna("")
     for c in ["Категория", "Производитель (корректный)", "Бренд (корректный)", "Название"]:
@@ -157,8 +165,9 @@ def build(contour):
         "generated": pd.Timestamp.now().strftime("%d.%m.%Y %H:%M"),
         "periods": {"label": label.tolist(), "year": cal["Год"].tolist(),
                     "num": (cal["Неделя"] if weekly else cal["Месяц"]).tolist(),
-                    "month": cal["Месяц"].tolist(), "start": cal["НачалоПериода"].dt.strftime("%d.%m.%Y").tolist(),
-                    "pg": pg.tolist()},
+                    "month": cal["Месяц"].tolist(), "quarter": cal["Квартал"].tolist(), "ord": cal["Номер"].tolist(),
+                    "start": cal["НачалоПериода"].dt.strftime("%d.%m.%Y").tolist(),
+                    "end": cal["КонецПериода"].dt.strftime("%d.%m.%Y").tolist(), "pg": pg.tolist()},
         "nets": nets, "fos": fos, "categories": categories, "producers": producers, "brands": brands,
         "products": {"plu": products["PLU"].tolist(), "name": products["Название"].tolist(),
                      "cat": codes(products["Категория"], categories).tolist(),
@@ -199,11 +208,8 @@ def main():
         meta, data, fact_rows, raw = build(contour)
         path = OUT / f"X5_дашборд_{name}.html"
         path.write_text(render(meta, data), encoding="utf-8")
-        size = path.stat().st_size / 1e6
         print(f"{path.name}: строк фактов {fact_rows} -> после свёртки до ФО {meta['check']['rows']}, "
-              f"данные {raw / 1e6:.0f} МБ -> файл {size:.1f} МБ")
-        if size > 25 and not START_YEAR:
-            print("  Файл тяжёлый для почты. Чтобы облегчить, поставь в настройках START_YEAR, например 2024.")
+              f"данные {raw / 1e6:.0f} МБ -> файл {path.stat().st_size / 1e6:.1f} МБ")
     print(f"Готово. Файлы лежат в {OUT}")
 
 
@@ -256,6 +262,13 @@ h1 { font-size: 20px; font-weight: 600; margin: 0; }
 .ms-label { color: var(--ink2); }
 .ms-val { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ms-btn[data-active="true"] { border-color: var(--s1); }
+.field { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 0 0 10px; border: 1px solid var(--border);
+  border-radius: 8px; background: var(--surface); }
+.select { height: 30px; border: 0; background: transparent; color: var(--ink); font: inherit; font-weight: 500; padding: 0 6px; max-width: 230px; cursor: pointer; }
+.select option { background: var(--surface); color: var(--ink); }
+.period { color: var(--ink2); font-size: 13px; margin: -6px 0 14px; }
+.period b { color: var(--ink); font-weight: 600; }
+.period .warn { color: var(--ink); }
 .ms-panel { position: absolute; top: 36px; left: 0; z-index: 40; width: 300px; max-height: 360px; display: flex; flex-direction: column;
   background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.12); }
 .ms-panel[hidden] { display: none; }
@@ -265,7 +278,7 @@ h1 { font-size: 20px; font-weight: 600; margin: 0; }
 .ms-item:hover { background: var(--wash); }
 .ms-item input { margin: 0; accent-color: var(--s1); }
 .ms-all { border-bottom: 1px solid var(--border); padding-bottom: 6px; margin-bottom: 4px; font-weight: 500; }
-.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 16px; }
 .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
 .tile .label { color: var(--ink2); font-size: 13px; }
 .tile .value { font-size: 26px; font-weight: 600; margin-top: 4px; }
@@ -439,17 +452,42 @@ footer p { margin: 4px 0; max-width: 1100px; }
   const nN = META.nets.length, nF = META.fos.length, nK = META.products.plu.length;
   const nProd = META.producers.length, nBrand = META.brands.length;
   const catOf = META.products.cat, prodOf = META.products.prod, brandOf = META.products.brand;
-  const years = [...new Set(per.year)].sort((a, b) => a - b);
   // Свой бренд — больше половины его SKU у своего производителя (в классификаторе бывают единичные чужие SKU)
   const ownCnt = new Int32Array(nBrand), allCnt = new Int32Array(nBrand);
   for (let k = 0; k < nK; k++) { allCnt[brandOf[k]]++; if (prodOf[k] === META.own) ownCnt[brandOf[k]]++; }
   const isOwnBrand = b => META.own >= 0 && ownCnt[b] * 2 > allCnt[b];
-  const lastLabel = per.label[nP - 1];
   document.getElementById('subtitle').textContent =
-    `${weekly ? 'Недели, месяцы по 4-4-5' : 'Календарные месяцы'} · данные с ${per.label[0]} по ${lastLabel} · собрано ${META.generated}`;
+    `${weekly ? 'Недели; месяцы и кварталы по 4-4-5' : 'Календарные месяцы'} · данные с ${per.label[0]} по ${per.label[nP - 1]} · собрано ${META.generated}`;
+
+  // ---------- периоды ----------
+  // ord — сквозной номер недели (месяца). По нему строятся скользящие окна и PP: пропуски в данных окна не сдвигают.
+  const ord = per.ord, ordIndex = new Map(ord.map((o, p) => [o, p]));
+  const SPANS = weekly
+    ? [['P', 'Нед', 'Одна неделя'], ['L4', 'L4W', 'Последние 4 недели'], ['L13', 'L13W', 'Последние 13 недель'],
+       ['MTD', 'MTD', 'С начала месяца 4-4-5 до выбранной недели'], ['QTD', 'QTD', 'С начала квартала 4-4-5 до выбранной недели'],
+       ['YTD', 'YTD', 'С начала года до выбранной недели'], ['MAT', 'MAT', 'Последние 52 недели']]
+    : [['P', 'Мес', 'Один месяц'], ['L3', 'L3M', 'Последние 3 месяца'], ['QTD', 'QTD', 'С начала квартала до выбранного месяца'],
+       ['YTD', 'YTD', 'С начала года до выбранного месяца'], ['MAT', 'MAT', 'Последние 12 месяцев']];
+  const ROLL = { P: 1, L4: 4, L13: 13, L3: 3, MAT: weekly ? 52 : 12 };
+  const CHART_LEN = weekly ? 52 : 12, UNIT = weekly ? 'нед.' : 'мес.';
+  const DAY = 86400000, EPOCH = Date.UTC(2000, 0, 3);   // понедельник, от него идёт сквозной номер недели
+  const dm = ms => { const d = new Date(ms); return String(d.getUTCDate()).padStart(2, '0') + '.' + String(d.getUTCMonth() + 1).padStart(2, '0'); };
+  function axisLabel(o) {
+    if (weekly) {
+      const ms = EPOCH + o * 7 * DAY, th = new Date(ms + 3 * DAY), y = th.getUTCFullYear();
+      const w = 1 + Math.floor((th.getTime() - Date.UTC(y, 0, 1)) / DAY / 7);
+      return { short: 'Н' + w, long: `Неделя ${w} ${y} (${dm(ms)}–${dm(ms + 6 * DAY)})` };
+    }
+    const y = Math.floor(o / 12), mo = o - y * 12;
+    return { short: mo === 0 ? `${MON3[0]} ${String(y).slice(2)}` : MON3[mo], long: `${MONTHS[mo]} ${y}` };
+  }
+  const periodName = p => (weekly ? `${per.label[p]} · ${per.start[p].slice(0, 5)}–${per.end[p].slice(0, 5)}`
+    : `${MONTHS[per.month[p] - 1]} ${per.year[p]}`);
 
   // ---------- состояние и расчёт ----------
-  const state = { year: years[years.length - 1], months: new Set(), nets: new Set(), fos: new Set(), cats: new Set(), prods: new Set(), brands: new Set() };
+  const DEFAULTS = { span: 'YTD', cmp: 'YA' };
+  const state = { end: nP - 1, span: DEFAULTS.span, cmp: DEFAULTS.cmp,
+    nets: new Set(), fos: new Set(), cats: new Set(), prods: new Set(), brands: new Set() };
 
   function mask(n, set) {
     const m = new Uint8Array(n);
@@ -457,12 +495,40 @@ footer p { margin: 4px 0; max-width: 1100px; }
     return m;
   }
 
-  function compute(st) {
-    const perSel = new Uint8Array(nP), perPy = new Uint8Array(nP), sel = [];
-    for (let p = 0; p < nP; p++) {
-      if (per.year[p] === st.year && (st.months.size === 0 || st.months.has(per.month[p]))) { perSel[p] = 1; sel.push(p); }
+  // W — периоды выбранного окна. C — окно сравнения: YA — те же недели ISO (те же месяцы) годом раньше,
+  // PP — столько же недель (месяцев) прямо перед W.
+  function periodWindow(st) {
+    const e = st.end, oe = ord[e], W = [];
+    let lo;
+    if (ROLL[st.span]) {
+      lo = oe - ROLL[st.span] + 1;
+      for (let p = 0; p < nP; p++) if (ord[p] >= lo && ord[p] <= oe) W.push(p);
+    } else {
+      for (let p = 0; p < nP; p++) {
+        if (ord[p] > oe || per.year[p] !== per.year[e]) continue;
+        if (st.span === 'QTD' && per.quarter[p] !== per.quarter[e]) continue;
+        if (st.span === 'MTD' && per.month[p] !== per.month[e]) continue;
+        W.push(p);
+      }
+      lo = ord[W[0]];
     }
-    for (const p of sel) if (per.pg[p] >= 0) perPy[per.pg[p]] = 1;
+    const len = oe - lo + 1, C = [];
+    if (st.cmp === 'YA') { for (const p of W) if (per.pg[p] >= 0) C.push(per.pg[p]); }
+    else for (let p = 0; p < nP; p++) if (ord[p] >= lo - len && ord[p] <= oe - len) C.push(p);
+    return { W, C, lo, oe, len, missing: len - W.length, cmpMissing: (st.cmp === 'YA' ? W.length : len) - C.length };
+  }
+
+  function compute(st) {
+    const win = periodWindow(st);
+    const pf = new Uint8Array(nP);   // 1 — окно, 2 — сравнение, 4 — ось графиков, 8 — YA для графика
+    for (const p of win.W) pf[p] |= 1;
+    for (const p of win.C) pf[p] |= 2;
+    const axis = [];
+    for (let o = Math.min(win.lo, win.oe - CHART_LEN + 1); o <= win.oe; o++) {
+      const p = ordIndex.has(o) ? ordIndex.get(o) : -1;
+      axis.push({ o, p });
+      if (p >= 0) { pf[p] |= 4; if (per.pg[p] >= 0) pf[per.pg[p]] |= 8; }
+    }
     const netM = mask(nN, st.nets), foM = mask(nF, st.fos);
     const catM = new Uint8Array(nK), fullM = new Uint8Array(nK);
     for (let k = 0; k < nK; k++) {
@@ -470,110 +536,102 @@ footer p { margin: 4px 0; max-width: 1100px; }
       catM[k] = c ? 1 : 0;
       fullM[k] = c && (st.prods.size === 0 || st.prods.has(prodOf[k])) && (st.brands.size === 0 || st.brands.has(brandOf[k])) ? 1 : 0;
     }
-    let selU = 0, selR = 0, selG = 0, selPU = 0, catU = 0, catR = 0, catG = 0, pyU = 0, pyR = 0, pyPU = 0, pyCatU = 0;
-    const selU_p = new Float64Array(nP), selS_p = new Float64Array(nP), pyU_p = new Float64Array(nP), pyS_p = new Float64Array(nP);
-    const catU_p = new Float64Array(nP), catS_p = new Float64Array(nP);
+    let wU = 0, wR = 0, wPU = 0, catU = 0, catR = 0, catG = 0, cU = 0, cR = 0, cPU = 0, cCatU = 0;
+    const selU_p = new Float64Array(nP), selS_p = new Float64Array(nP), catU_p = new Float64Array(nP), catS_p = new Float64Array(nP);
     const prodU = new Float64Array(nProd), prodPU = new Float64Array(nProd), prodDF = new Float64Array(nProd), prodDS = new Float64Array(nProd);
     const prodU_p = new Float64Array(nP * nProd);
     const brU = new Float64Array(nBrand), brR = new Float64Array(nBrand), brG = new Float64Array(nBrand), brPU = new Float64Array(nBrand);
-    const brPy = new Float64Array(nBrand), brS_p = new Float64Array(nP * nBrand);
-    const foU = new Float64Array(nF), foPy = new Float64Array(nF), foCat = new Float64Array(nF), foCatPy = new Float64Array(nF);
-    const nU = new Float64Array(nN), nPy = new Float64Array(nN), nCat = new Float64Array(nN), nCatPy = new Float64Array(nN);
-    const skU = new Float64Array(nK), skR = new Float64Array(nK), skPU = new Float64Array(nK), skPy = new Float64Array(nK);
+    const brC = new Float64Array(nBrand), brS_p = new Float64Array(nP * nBrand);
+    const foU = new Float64Array(nF), foC = new Float64Array(nF), foCat = new Float64Array(nF), foCatC = new Float64Array(nF);
+    const nU = new Float64Array(nN), nC = new Float64Array(nN), nCat = new Float64Array(nN), nCatC = new Float64Array(nN);
+    const skU = new Float64Array(nK), skR = new Float64Array(nK), skPU = new Float64Array(nK), skC = new Float64Array(nK);
     const P = D.P, N = D.N, F = D.F, K = D.K, U = D.U, R = D.R, Rk = D.Rk, G = D.G, PU = D.PU, S = D.S, DF = D.DF, DS = D.DS;
     for (let i = 0, n = P.length; i < n; i++) {
-      const p = P[i];
-      const isSel = perSel[p];
-      if (!isSel && !perPy[p]) continue;
+      const p = P[i], fl = pf[p];
+      if (!fl) continue;
       const f = F[i], net = N[i];
       if (!netM[net] || !foM[f]) continue;
       const k = K[i];
       if (!catM[k]) continue;
-      const u = U[i];
-      if (isSel) {
-        const r = R[i] + Rk[i] * 0.01, g = G[i], pu = PU[i], pr = prodOf[k];
-        catU += u; catR += r; catG += g; catU_p[p] += u; foCat[f] += u; nCat[net] += u;
-        prodU[pr] += u; prodPU[pr] += pu; prodDF[pr] += DF[i]; prodDS[pr] += DS[i]; prodU_p[p * nProd + pr] += u;
-        if (fullM[k]) {
-          const s = S[i], b = brandOf[k];
-          selU += u; selR += r; selG += g; selPU += pu; selU_p[p] += u; selS_p[p] += s;
-          brU[b] += u; brR[b] += r; brG[b] += g; brPU[b] += pu; brS_p[p * nBrand + b] += s;
+      const u = U[i], pr = prodOf[k], full = fullM[k];
+      catU_p[p] += u; prodU_p[p * nProd + pr] += u;
+      if (full) { selU_p[p] += u; selS_p[p] += S[i]; }
+      if (fl & 1) {
+        const r = R[i] + Rk[i] * 0.01, g = G[i], pu = PU[i];
+        catU += u; catR += r; catG += g; foCat[f] += u; nCat[net] += u;
+        prodU[pr] += u; prodPU[pr] += pu; prodDF[pr] += DF[i]; prodDS[pr] += DS[i];
+        if (full) {
+          const b = brandOf[k];
+          wU += u; wR += r; wPU += pu;
+          brU[b] += u; brR[b] += r; brG[b] += g; brPU[b] += pu; brS_p[p * nBrand + b] += S[i];
           foU[f] += u; nU[net] += u; skU[k] += u; skR[k] += r; skPU[k] += pu;
         }
-      } else {
-        pyCatU += u; foCatPy[f] += u; nCatPy[net] += u;
-        if (fullM[k]) {
-          pyU += u; pyR += R[i] + Rk[i] * 0.01; pyPU += PU[i]; pyU_p[p] += u; pyS_p[p] += S[i];
-          brPy[brandOf[k]] += u; foPy[f] += u; nPy[net] += u; skPy[k] += u;
+      }
+      if (fl & 2) {
+        cCatU += u; foCatC[f] += u; nCatC[net] += u;
+        if (full) {
+          cU += u; cR += R[i] + Rk[i] * 0.01; cPU += PU[i];
+          brC[brandOf[k]] += u; foC[f] += u; nC[net] += u; skC[k] += u;
         }
       }
     }
     const cP = D.cP, cN = D.cN, cF = D.cF, cS = D.cS;
     for (let j = 0; j < cP.length; j++) {
       const p = cP[j];
-      if ((perSel[p] || perPy[p]) && netM[cN[j]] && foM[cF[j]]) catS_p[p] += cS[j];
+      if ((pf[p] & 3) && netM[cN[j]] && foM[cF[j]]) catS_p[p] += cS[j];
     }
-    // TDP: средняя по периодам выбора; знаменатель — магазины с продажами всей категории БП
-    function tdpAvg(stores, offset, stride) {
+    // TDP: среднее по неделям (месяцам) окна; знаменатель — магазины с продажами всей категории БП
+    const tdpOver = (periods, stores, offset, stride) => {
       let sum = 0, cnt = 0;
-      for (const p of sel) if (catS_p[p] > 0) { sum += stores[p * stride + offset] / catS_p[p]; cnt++; }
+      for (const p of periods) if (catS_p[p] > 0) { sum += stores[p * stride + offset] / catS_p[p]; cnt++; }
       return cnt ? sum / cnt : null;
-    }
-    let tdpPySum = 0, tdpPyCnt = 0;
-    for (const p of sel) {
-      const q = per.pg[p];
-      if (q >= 0 && catS_p[q] > 0) { tdpPySum += pyS_p[q] / catS_p[q]; tdpPyCnt++; }
-    }
-    const kpi = {
-      units: selU, unitsPy: pyU, rub: selR, rubPy: pyR,
-      share: div(selU, catU), sharePy: div(pyU, pyCatU),
-      promo: div(selPU, selU), promoPy: div(pyPU, pyU),
-      price: div(selR, selU), pricePy: div(pyR, pyU),
-      tdp: tdpAvg(selS_p, 0, 1), tdpPy: tdpPyCnt ? tdpPySum / tdpPyCnt : null,
-      hasPy: sel.some(p => per.pg[p] >= 0),
     };
-    const chart1 = { labels: sel.map(p => per.label[p]), nums: sel.map(p => per.num[p]),
-      cur: sel.map(p => selU_p[p]), py: sel.map(p => (per.pg[p] >= 0 ? pyU_p[per.pg[p]] : null)) };
+    const hasCmp = win.C.length > 0;
+    const dShare = (a, b) => (hasCmp && ok(a) && ok(b) ? 100 * (a - b) : null);
+    const kpi = {
+      units: wU, unitsCmp: cU, rub: wR, rubCmp: cR,
+      share: div(wU, catU), shareCmp: div(cU, cCatU),
+      promo: div(wPU, wU), promoCmp: div(cPU, cU),
+      price: div(wR, wU), priceCmp: div(cR, cU),
+      tdp: tdpOver(win.W, selS_p, 0, 1), tdpCmp: tdpOver(win.C, selS_p, 0, 1), hasCmp,
+    };
+    const chart1 = { axis, band: [axis.findIndex(a => a.o >= win.lo), axis.length - 1],
+      cur: axis.map(a => (a.p >= 0 ? selU_p[a.p] : null)),
+      ya: axis.map(a => (a.p >= 0 && per.pg[a.p] >= 0 ? selU_p[per.pg[a.p]] : null)) };
     const prodRank = [...Array(nProd).keys()].filter(i => prodU[i] > 0).sort((a, b) => prodU[b] - prodU[a]);
     const top5 = prodRank.slice(0, 5), top10 = prodRank.slice(0, 10);
-    const chart2 = { labels: chart1.labels, series: top5.map(pr => ({ prod: pr,
-      values: sel.map(p => (catU_p[p] > 0 ? prodU_p[p * nProd + pr] / catU_p[p] : null)) })) };
+    const chart2 = { series: top5.map(pr => ({ prod: pr,
+      values: axis.map(a => (a.p >= 0 && catU_p[a.p] > 0 ? prodU_p[a.p * nProd + pr] / catU_p[a.p] : null)) })) };
     const chart3 = top10.map(pr => ({ prod: pr, share: div(prodU[pr], catU) }));
     const chart4 = top10.map(pr => ({ prod: pr, promo: div(prodPU[pr], prodU[pr]),
       depth: prodDF[pr] > 0 ? prodDS[pr] / prodDF[pr] : null }));
-    const brands = [];
+    const brands = [], fos = [], nets = [], skus = [];
     for (let b = 0; b < nBrand; b++) {
-      if (!brU[b] && !brPy[b]) continue;
-      const share = div(brU[b], catU), sharePy = div(brPy[b], pyCatU);
-      brands.push({ brand: b, units: brU[b], unitsPy: brPy[b], growth: growth(brU[b], brPy[b]), share, sharePy,
-        dShare: ok(share) && ok(sharePy) && kpi.hasPy ? 100 * (share - sharePy) : null,
-        promo: div(brPU[b], brU[b]), price: div(brR[b], brU[b]),
+      if (!brU[b] && !brC[b]) continue;
+      const share = div(brU[b], catU), shareCmp = div(brC[b], cCatU);
+      brands.push({ brand: b, units: brU[b], unitsCmp: brC[b], growth: growth(brU[b], brC[b]), share, shareCmp,
+        dShare: dShare(share, shareCmp), promo: div(brPU[b], brU[b]), price: div(brR[b], brU[b]),
         index: brG[b] > 0 && catG > 0 && catR > 0 ? (brR[b] / brG[b]) / (catR / catG) : null,
-        tdp: tdpAvg(brS_p, b, nBrand) });
+        tdp: tdpOver(win.W, brS_p, b, nBrand) });
     }
-    const fos = [];
     for (let f = 0; f < nF; f++) {
-      if (!foCat[f] && !foCatPy[f]) continue;
-      const share = div(foU[f], foCat[f]), sharePy = div(foPy[f], foCatPy[f]);
-      fos.push({ fo: f, units: foU[f], unitsPy: foPy[f], growth: growth(foU[f], foPy[f]), share, sharePy,
-        dShare: ok(share) && ok(sharePy) && kpi.hasPy ? 100 * (share - sharePy) : null });
+      if (!foCat[f] && !foCatC[f]) continue;
+      const share = div(foU[f], foCat[f]), shareCmp = div(foC[f], foCatC[f]);
+      fos.push({ fo: f, units: foU[f], unitsCmp: foC[f], growth: growth(foU[f], foC[f]), share, shareCmp, dShare: dShare(share, shareCmp) });
     }
-    const nets = [];
     for (let n = 0; n < nN; n++) {
-      if (!nCat[n] && !nCatPy[n]) continue;
-      const share = div(nU[n], nCat[n]), sharePy = div(nPy[n], nCatPy[n]);
-      nets.push({ net: n, units: nU[n], unitsPy: nPy[n], growth: growth(nU[n], nPy[n]), share, sharePy,
-        dShare: ok(share) && ok(sharePy) && kpi.hasPy ? 100 * (share - sharePy) : null });
+      if (!nCat[n] && !nCatC[n]) continue;
+      const share = div(nU[n], nCat[n]), shareCmp = div(nC[n], nCatC[n]);
+      nets.push({ net: n, units: nU[n], unitsCmp: nC[n], growth: growth(nU[n], nC[n]), share, shareCmp, dShare: dShare(share, shareCmp) });
     }
-    const skus = [];
     for (let k = 0; k < nK; k++) {
-      if (!skU[k] && !skPy[k]) continue;
-      skus.push({ k, units: skU[k], unitsPy: skPy[k], growth: growth(skU[k], skPy[k]), price: div(skR[k], skU[k]),
+      if (!skU[k] && !skC[k]) continue;
+      skus.push({ k, units: skU[k], unitsCmp: skC[k], growth: growth(skU[k], skC[k]), price: div(skR[k], skU[k]),
         promo: div(skPU[k], skU[k]), share: div(skU[k], catU) });
     }
-    const total = { units: selU, unitsPy: pyU, growth: growth(selU, pyU), share: kpi.share, sharePy: kpi.sharePy,
-      dShare: ok(kpi.share) && ok(kpi.sharePy) && kpi.hasPy ? 100 * (kpi.share - kpi.sharePy) : null };
-    return { sel, kpi, chart1, chart2, chart3, chart4, brands, fos, nets, skus, total };
+    const total = { units: wU, unitsCmp: cU, growth: growth(wU, cU), share: kpi.share, shareCmp: kpi.shareCmp,
+      dShare: dShare(kpi.share, kpi.shareCmp) };
+    return { win, kpi, chart1, chart2, chart3, chart4, brands, fos, nets, skus, total };
   }
 
   // ---------- интерфейс: срезы ----------
@@ -659,21 +717,29 @@ footer p { margin: 4px 0; max-width: 1100px; }
   }
 
   const controls = {};
+  function segmented(label, options, get, set) {
+    const wrap = el('div', { class: 'seg', role: 'group', 'aria-label': label });
+    const buttons = options.map(o => {
+      const b = el('button', { type: 'button', text: o.text, title: o.title || null });
+      b.addEventListener('click', () => { set(o.value); refresh(); schedule(); });
+      return b;
+    });
+    function refresh() { buttons.forEach((b, i) => b.setAttribute('aria-pressed', String(get() === options[i].value))); }
+    wrap.append(...buttons);
+    refresh();
+    return { wrap, refresh };
+  }
   function buildFilters() {
     const bar = el('div', { class: 'filters', role: 'region', 'aria-label': 'Срезы' });
-    const seg = el('div', { class: 'seg', role: 'group', 'aria-label': 'Год' });
-    for (const y of years) {
-      const b = el('button', { type: 'button', text: String(y), 'aria-pressed': String(y === state.year) });
-      b.addEventListener('click', () => {
-        state.year = y;
-        for (const x of seg.children) x.setAttribute('aria-pressed', String(x === b));
-        schedule();
-      });
-      seg.append(b);
-    }
-    controls.years = seg;
-    const monthOpts = MONTHS.map((t, i) => ({ value: i + 1, text: t }));
-    controls.months = multiSelect(weekly ? 'Месяц 4-4-5' : 'Месяц', state.months, () => monthOpts, schedule);
+    const sel = el('select', { class: 'select', 'aria-label': weekly ? 'Неделя, которой заканчивается период' : 'Месяц, которым заканчивается период' });
+    for (let p = nP - 1; p >= 0; p--) sel.append(el('option', { value: String(p), text: periodName(p) }));
+    sel.addEventListener('change', () => { state.end = Number(sel.value); schedule(); });
+    controls.end = { wrap: el('label', { class: 'field' }, el('span', { class: 'ms-label', text: 'До' }), sel),
+      refresh: () => { sel.value = String(state.end); } };
+    controls.end.refresh();
+    controls.span = segmented('Длина периода', SPANS.map(([value, text, title]) => ({ value, text, title })), () => state.span, v => { state.span = v; });
+    controls.cmp = segmented('Сравнение', [{ value: 'YA', text: 'vs YA', title: 'С тем же периодом год назад' },
+      { value: 'PP', text: 'vs PP', title: 'С предыдущим периодом той же длины' }], () => state.cmp, v => { state.cmp = v; });
     controls.nets = multiSelect('Сеть', state.nets, () => META.nets.map((t, i) => ({ value: i, text: t })), schedule);
     controls.fos = multiSelect('ФО', state.fos, () => META.fos.map((t, i) => ({ value: i, text: t })), schedule);
     controls.cats = multiSelect('Категория', state.cats, () => META.categories.map((t, i) => ({ value: i, text: t })), () => {
@@ -686,15 +752,15 @@ footer p { margin: 4px 0; max-width: 1100px; }
     controls.brands = multiSelect('Бренд', state.brands, availableBrands, schedule);
     const reset = el('button', { class: 'btn', type: 'button', text: 'Сбросить' });
     reset.addEventListener('click', () => {
-      state.year = years[years.length - 1];
-      for (const k of ['months', 'nets', 'fos', 'cats', 'prods', 'brands']) { state[k].clear(); controls[k].refresh(); }
-      for (const x of seg.children) x.setAttribute('aria-pressed', String(Number(x.textContent) === state.year));
-      schedule();
+      Object.assign(state, { end: nP - 1 }, DEFAULTS);
+      for (const k of ['nets', 'fos', 'cats', 'prods', 'brands']) state[k].clear();
+      syncControls(); schedule();
     });
-    bar.append(seg, controls.months.wrap, controls.nets.wrap, controls.fos.wrap, controls.cats.wrap,
-      controls.prods.wrap, controls.brands.wrap, reset);
+    bar.append(controls.end.wrap, controls.span.wrap, controls.cmp.wrap, controls.nets.wrap, controls.fos.wrap,
+      controls.cats.wrap, controls.prods.wrap, controls.brands.wrap, reset);
     return bar;
   }
+  function syncControls() { for (const c of Object.values(controls)) c.refresh(); }
 
   // ---------- показатели ----------
   const tiles = {};
@@ -713,27 +779,27 @@ footer p { margin: 4px 0; max-width: 1100px; }
   }
   function setDelta(node, d, tone) {
     node.textContent = '';
-    if (!d) { node.className = 'delta none'; node.textContent = 'к ПГ: нет данных'; return; }
+    if (!d) { node.className = 'delta none'; node.textContent = `к ${state.cmp}: нет данных`; return; }
     node.className = 'delta ' + (d.dir === 0 ? 'neutral' : tone(d.dir > 0));
     if (d.dir) node.append(el('span', { 'aria-hidden': 'true', text: d.dir > 0 ? '▲ ' : '▼ ' }));
-    node.append(document.createTextNode(d.text + ' к ПГ'));
+    node.append(document.createTextNode(`${d.text} к ${state.cmp}`));
   }
   const goodUp = up => (up ? 'good' : 'bad');
   const neutralTone = () => 'neutral';
   function renderKpis(r) {
-    const k = r.kpi;
+    const k = r.kpi, c = k.hasCmp;
     tiles.units.value.textContent = fmt.compact(k.units);
-    setDelta(tiles.units.delta, k.hasPy ? delta(growth(k.units, k.unitsPy), 'pct') : null, goodUp);
+    setDelta(tiles.units.delta, c ? delta(growth(k.units, k.unitsCmp), 'pct') : null, goodUp);
     tiles.rub.value.textContent = fmt.compact(k.rub);
-    setDelta(tiles.rub.delta, k.hasPy ? delta(growth(k.rub, k.rubPy), 'pct') : null, goodUp);
+    setDelta(tiles.rub.delta, c ? delta(growth(k.rub, k.rubCmp), 'pct') : null, goodUp);
     tiles.share.value.textContent = fmt.pct(k.share);
-    setDelta(tiles.share.delta, k.hasPy && ok(k.share) && ok(k.sharePy) ? delta(100 * (k.share - k.sharePy), 'pp') : null, goodUp);
+    setDelta(tiles.share.delta, c && ok(k.share) && ok(k.shareCmp) ? delta(100 * (k.share - k.shareCmp), 'pp') : null, goodUp);
     tiles.promo.value.textContent = fmt.pct(k.promo);
-    setDelta(tiles.promo.delta, k.hasPy && ok(k.promo) && ok(k.promoPy) ? delta(100 * (k.promo - k.promoPy), 'pp') : null, neutralTone);
+    setDelta(tiles.promo.delta, c && ok(k.promo) && ok(k.promoCmp) ? delta(100 * (k.promo - k.promoCmp), 'pp') : null, neutralTone);
     tiles.price.value.textContent = fmt.rub(k.price);
-    setDelta(tiles.price.delta, k.hasPy && ok(k.price) && ok(k.pricePy) ? delta(k.price / k.pricePy - 1, 'pct') : null, neutralTone);
+    setDelta(tiles.price.delta, c && ok(k.price) && ok(k.priceCmp) ? delta(k.price / k.priceCmp - 1, 'pct') : null, neutralTone);
     tiles.tdp.value.textContent = fmt.tdp(k.tdp);
-    setDelta(tiles.tdp.delta, k.hasPy && ok(k.tdp) && ok(k.tdpPy) ? delta(100 * (k.tdp - k.tdpPy), 'pt') : null, goodUp);
+    setDelta(tiles.tdp.delta, c && ok(k.tdp) && ok(k.tdpCmp) ? delta(100 * (k.tdp - k.tdpCmp), 'pt') : null, goodUp);
   }
 
   // ---------- карточки и табличный вид ----------
@@ -807,7 +873,7 @@ footer p { margin: 4px 0; max-width: 1100px; }
     host.textContent = '';
     const n = cfg.labels.length;
     if (!n || !cfg.series.some(s => s.values.some(ok))) { host.append(el('div', { class: 'empty', text: 'Нет данных для выбранных срезов' })); c.legend.textContent = ''; return; }
-    const W = Math.max(320, host.clientWidth || 600), H = 250, m = { l: 58, r: 84, t: 12, b: 28 };
+    const W = Math.max(320, host.clientWidth || 600), H = 262, m = { l: 58, r: 84, t: 24, b: 28 };
     const iw = W - m.l - m.r, ih = H - m.t - m.b;
     let lo = 0, hi = 0;
     for (const s of cfg.series) for (const v of s.values) if (ok(v)) { hi = Math.max(hi, v); lo = Math.min(lo, v); }
@@ -816,6 +882,17 @@ footer p { margin: 4px 0; max-width: 1100px; }
     const X = i => m.l + (n === 1 ? iw / 2 : (i * iw) / (n - 1));
     const Y = v => m.t + ih - ((v - y0) / (y1 - y0)) * ih;
     const root = svg('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': cfg.aria });
+    if (cfg.band && cfg.band[0] > 0) {
+      const half = n > 1 ? iw / (n - 1) / 2 : 0;
+      const x0 = Math.max(m.l, X(cfg.band[0]) - half), x1 = Math.min(m.l + iw, X(cfg.band[1]) + half);
+      root.append(svg('rect', { x: x0, y: m.t, width: Math.max(1, x1 - x0), height: ih, fill: 'var(--wash)' }));
+      if (cfg.bandLabel) {   // подпись над областью графика, чтобы не ложилась на линии
+        const wide = x1 - x0 >= 48;
+        const bt = svg('text', { x: wide ? x0 + 4 : x1, y: m.t - 8, 'text-anchor': wide ? 'start' : 'end' });
+        bt.textContent = cfg.bandLabel;
+        root.append(bt);
+      }
+    }
     for (const t of ticks) {
       root.append(svg('line', { x1: m.l, x2: W - m.r, y1: Y(t), y2: Y(t), stroke: t === 0 ? 'var(--axis)' : 'var(--grid)', 'stroke-width': 1 }));
       const tx = svg('text', { x: m.l - 8, y: Y(t) + 4, 'text-anchor': 'end' });
@@ -954,7 +1031,7 @@ footer p { margin: 4px 0; max-width: 1100px; }
       const table = el('table', { class: 'data' });
       const head = el('tr');
       for (const cdef of columns) {
-        const th = el('th', { class: cdef.num ? 'num' : '', text: cdef.title, scope: 'col', tabindex: 0 });
+        const th = el('th', { class: cdef.num ? 'num' : '', text: typeof cdef.title === 'function' ? cdef.title() : cdef.title, scope: 'col', tabindex: 0 });
         if (cdef.key === t.sortKey) th.setAttribute('aria-sort', t.dir > 0 ? 'ascending' : 'descending');
         const sortBy = () => { if (t.sortKey === cdef.key) t.dir = -t.dir; else { t.sortKey = cdef.key; t.dir = cdef.num ? -1 : 1; } draw(); };
         th.addEventListener('click', sortBy);
@@ -978,46 +1055,44 @@ footer p { margin: 4px 0; max-width: 1100px; }
 
   // ---------- сборка страницы ----------
   app.textContent = '';
-  app.append(buildFilters(), buildKpis());
+  const periodLine = el('div', { class: 'period', role: 'status' });
+  app.append(buildFilters(), periodLine, buildKpis());
   const periodWord = weekly ? 'неделям' : 'месяцам';
-  const c1 = card(`Продажи, шт по ${periodWord}`, 'Выбранный год и тот же период прошлого года');
-  const c2 = card(`Доля в категории по ${periodWord}: топ-5 производителей`, 'Доля в штуках · не зависит от срезов производителя и бренда');
+  const lastWord = weekly ? 'Последние 52 недели' : 'Последние 12 месяцев';
+  const c1 = card(`Продажи, шт по ${periodWord}`, `${lastWord} и YA · выбранный период выделен фоном`);
+  const c2 = card(`Доля в категории по ${periodWord}: топ-5 производителей`, `${lastWord} · топ-5 за выбранный период · не зависит от срезов производителя и бренда`);
   const c3 = card('Доля производителей в категории, шт', 'Топ-10 за выбранный период · не зависит от срезов производителя и бренда');
   const c4 = card('Промо по производителям', 'Доля промо в продажах, шт и взвешенная глубина промо · топ-10 · без срезов производителя и бренда');
   app.append(el('div', { class: 'grid2' }, c1.node, c2.node), el('div', { class: 'grid2' }, c3.node, c4.node));
   const name = k => META.products.name[k];
   const ownMark = (text, own) => (own ? el('span', { class: 'own', text }) : document.createTextNode(text));
+  const growthTitle = () => `Прирост к ${state.cmp}`, shareTitle = () => `Изменение доли к ${state.cmp}`;
   const tBrands = dataTable('Бренды', 'Доля и индекс цены — от категорий из среза «Категория» в тех же сетях, ФО и периоде', [
     { key: 'name', title: 'Бренд', render: r => el('td', { class: 'name', title: r.name }, ownMark(r.name, r.own)) },
     { key: 'units', title: 'Продажи, шт', num: true, fmt: fmt.int },
-    { key: 'growth', title: 'Прирост к ПГ', num: true, delta: 'pct' },
+    { key: 'growth', title: growthTitle, num: true, delta: 'pct' },
     { key: 'share', title: 'Доля в категории', num: true, fmt: fmt.pct },
-    { key: 'dShare', title: 'Изменение доли', num: true, delta: 'pp' },
+    { key: 'dShare', title: shareTitle, num: true, delta: 'pp' },
     { key: 'promo', title: 'Доля промо', num: true, fmt: fmt.pct },
     { key: 'price', title: 'Цена за шт', num: true, fmt: fmt.rub },
     { key: 'index', title: 'Индекс цены за кг', num: true, fmt: fmt.idx },
     { key: 'tdp', title: 'TDP средняя', num: true, fmt: fmt.tdp },
   ], { sortKey: 'units', limit: 20, full: true });
   app.append(tBrands.node);
-  const tFo = dataTable('Федеральные округа', 'Доля — в категории своего округа', [
-    { key: 'name', title: 'ФО' },
+  const geoColumns = label => [
+    { key: 'name', title: label },
     { key: 'units', title: 'Продажи, шт', num: true, fmt: fmt.int },
-    { key: 'growth', title: 'Прирост к ПГ', num: true, delta: 'pct' },
+    { key: 'growth', title: growthTitle, num: true, delta: 'pct' },
     { key: 'share', title: 'Доля в категории', num: true, fmt: fmt.pct },
-    { key: 'dShare', title: 'Изменение доли', num: true, delta: 'pp' },
-  ], { sortKey: 'units' });
-  const tNets = dataTable('Сети', 'Доля — в категории своей сети', [
-    { key: 'name', title: 'Сеть' },
-    { key: 'units', title: 'Продажи, шт', num: true, fmt: fmt.int },
-    { key: 'growth', title: 'Прирост к ПГ', num: true, delta: 'pct' },
-    { key: 'share', title: 'Доля в категории', num: true, fmt: fmt.pct },
-    { key: 'dShare', title: 'Изменение доли', num: true, delta: 'pp' },
-  ], { sortKey: 'units' });
+    { key: 'dShare', title: shareTitle, num: true, delta: 'pp' },
+  ];
+  const tFo = dataTable('Федеральные округа', 'Доля — в категории своего округа', geoColumns('ФО'), { sortKey: 'units' });
+  const tNets = dataTable('Сети', 'Доля — в категории своей сети', geoColumns('Сеть'), { sortKey: 'units' });
   const tSku = dataTable('SKU', 'Доля — в категориях из среза «Категория» в тех же сетях, ФО и периоде', [
     { key: 'name', title: 'SKU', render: r => el('td', { class: 'name', title: `${r.name} · PLU ${r.plu}` }, document.createTextNode(r.name), el('span', { class: 'plu', text: r.plu })) },
     { key: 'brandName', title: 'Бренд' },
     { key: 'units', title: 'Продажи, шт', num: true, fmt: fmt.int },
-    { key: 'growth', title: 'Прирост к ПГ', num: true, delta: 'pct' },
+    { key: 'growth', title: growthTitle, num: true, delta: 'pct' },
     { key: 'price', title: 'Цена за шт', num: true, fmt: fmt.rub },
     { key: 'promo', title: 'Доля промо', num: true, fmt: fmt.pct },
     { key: 'share', title: 'Доля в категории', num: true, fmt: fmt.pct },
@@ -1025,29 +1100,46 @@ footer p { margin: 4px 0; max-width: 1100px; }
   app.append(el('div', { class: 'grid2' }, tFo.node, tNets.node), tSku.node);
   app.append(el('footer', {},
     el('p', { text: 'Источник: X5 Dialog, отчёт «Анализ трендов», выгрузка из ClickHouse. Регионы сведены в федеральные округа.' }),
-    el('p', { text: 'Доля в категории — продажи выбранного в штуках к продажам категорий из среза «Категория» в тех же сетях, ФО и периоде; срезы производителя и бренда на знаменатель не влияют. В таблицах ФО и сетей доля считается внутри своего округа или своей сети. Изменение доли — в процентных пунктах к тому же периоду прошлого года.' }),
     el('p', { text: weekly
-      ? 'ПГ — те же недели ISO прошлого года (у 53-й недели пары нет). Месяцы недельных данных — по схеме 4-4-5.'
-      : 'ПГ — те же месяцы прошлого года.' }),
+      ? 'Период задаётся последней неделей («До») и длиной: Нед — одна неделя; L4W и L13W — последние 4 и 13 недель; MTD, QTD и YTD — с начала месяца, квартала или года до выбранной недели, месяцы и кварталы по 4-4-5; MAT — последние 52 недели.'
+      : 'Период задаётся последним месяцем («До») и длиной: Мес — один месяц; L3M — последние 3 месяца; QTD и YTD — с начала квартала или года до выбранного месяца; MAT — последние 12 месяцев.' }),
+    el('p', { text: weekly
+      ? 'YA — те же недели ISO годом раньше; у 53-й недели пары нет, это видно в строке периода. PP — столько же недель сразу перед выбранным периодом.'
+      : 'YA — те же месяцы годом раньше. PP — столько же месяцев сразу перед выбранным периодом.' }),
+    el('p', { text: 'Доля в категории — продажи выбранного в штуках к продажам категорий из среза «Категория» в тех же сетях, ФО и периоде; срезы производителя и бренда на знаменатель не влияют. В таблицах ФО и сетей доля считается внутри своего округа или своей сети. Изменение доли — в процентных пунктах к периоду сравнения.' }),
     el('p', { text: 'Взвешенная глубина промо — на сколько промо-цена ниже обычной цены тех же SKU в той же сети, регионе и периоде, взвешено по промо-штукам. Строки, где SKU продавался только по промо, пропускаются.' }),
-    el('p', { text: 'TDP — сумма нумерических дистрибуций SKU в пунктах: для каждого SKU берётся доля магазинов с его продажами среди магазинов с продажами всей категории БП, в процентах, и доли складываются. TDP 250 — в среднем 2,5 SKU в магазине. TDP средняя — среднее по периодам выбора. Магазин засчитывается, только если в нём была продажа. В Excel та же мера показана в процентах: 250% там — это 250 здесь.' }),
+    el('p', { text: `TDP — сумма нумерических дистрибуций SKU в пунктах: для каждого SKU берётся доля магазинов с его продажами среди магазинов с продажами всей категории БП, в процентах, и доли складываются. TDP 250 — в среднем 2,5 SKU в магазине. TDP средняя — среднее по ${periodWord} периода. Магазин засчитывается, только если в нём была продажа. В Excel та же мера показана в процентах: 250% там — это 250 здесь.` }),
     el('p', { text: 'Индекс цены за кг — цена за кг бренда к цене за кг категории; 1,00 — на уровне категории. Чеки, покупатели и взвешенная дистрибуция здесь не показаны: для брендов из данных X5 их честно не посчитать.' }),
     el('p', { id: 'perf', class: 'sub' })));
 
+  function renderPeriod(win) {
+    const spanText = SPANS.find(s => s[0] === state.span)[1];
+    const range = ps => (!ps.length ? 'нет данных' : ps.length === 1 ? per.label[ps[0]] : `${per.label[ps[0]]} – ${per.label[ps[ps.length - 1]]}`);
+    periodLine.textContent = '';
+    periodLine.append(el('b', { text: spanText }), document.createTextNode(` · ${range(win.W)} · ${win.W.length} ${UNIT} · ${state.cmp}: ${range(win.C)}`));
+    const warn = [];
+    if (win.missing > 0) warn.push(`в периоде нет данных за ${win.missing} ${UNIT}`);
+    if (win.cmpMissing > 0) warn.push(state.cmp === 'YA' ? `у ${win.cmpMissing} ${UNIT} нет пары в YA` : `в PP нет данных за ${win.cmpMissing} ${UNIT}`);
+    if (warn.length) periodLine.append(el('span', { class: 'warn', text: ' · ⚠ ' + warn.join(', ') }));
+  }
+
   let last = null;
   function drawCharts(r) {
-    const y = state.year;
-    const xLabel = i => (weekly ? 'Н' + r.chart1.nums[i] : MON3[r.chart1.nums[i] - 1]);
-    const tipTitle = i => (weekly ? `Неделя ${r.chart1.nums[i]} (${r.chart1.labels[i]})` : MONTHS[r.chart1.nums[i] - 1] + ' ' + y);
-    c1.rows = r.chart1.labels.map((l, i) => [l, fmt.int(r.chart1.cur[i]), fmt.int(r.chart1.py[i])]);
-    c1.head = ['Период', `${y}, шт`, `${y - 1}, шт`];
-    lineChart(c1, { labels: r.chart1.labels, xLabel, tipTitle, fmt: fmt.compact, axisFmt: v => fmt.compact(v), sortTip: false, aria: `Продажи в штуках по ${periodWord}, ${y} и ${y - 1}`,
-      series: [{ name: String(y), color: 'var(--s1)', values: r.chart1.cur }, { name: `${y - 1} (ПГ)`, color: 'var(--other)', values: r.chart1.py }] });
-    c2.rows = r.chart1.labels.map((l, i) => [l, ...r.chart2.series.map(s => fmt.pct(s.values[i]))]);
+    const ax = r.chart1.axis, labels = ax.map(a => axisLabel(a.o));
+    const xLabel = i => labels[i].short;
+    const tipTitle = i => labels[i].long + (ax[i].p < 0 ? ' · нет данных' : '');
+    const bandLabel = SPANS.find(s => s[0] === state.span)[1];
+    c1.rows = ax.map((a, i) => [labels[i].long, fmt.int(r.chart1.cur[i]), fmt.int(r.chart1.ya[i])]);
+    c1.head = ['Период', 'Продажи, шт', 'YA, шт'];
+    lineChart(c1, { labels, xLabel, tipTitle, band: r.chart1.band, bandLabel, fmt: fmt.compact, axisFmt: v => fmt.compact(v), sortTip: false,
+      aria: `Продажи в штуках по ${periodWord} и YA`,
+      series: [{ name: 'Продажи', color: 'var(--s1)', values: r.chart1.cur }, { name: 'YA', color: 'var(--other)', values: r.chart1.ya }] });
+    c2.rows = ax.map((a, i) => [labels[i].long, ...r.chart2.series.map(s => fmt.pct(s.values[i]))]);
     c2.head = ['Период', ...r.chart2.series.map(s => META.producers[s.prod])];
     const pctAxis = (v, step) => { const d = step * 100 >= 0.999 ? 0 : step * 100 >= 0.0999 ? 1 : 2;
       return new Intl.NumberFormat('ru-RU', { minimumFractionDigits: d, maximumFractionDigits: d }).format(v * 100) + '%'; };
-    lineChart(c2, { labels: r.chart1.labels, xLabel, tipTitle, fmt: fmt.pct, axisFmt: pctAxis, sortTip: true, aria: 'Доля производителей в категории по периодам',
+    lineChart(c2, { labels, xLabel, tipTitle, band: r.chart1.band, bandLabel, fmt: fmt.pct, axisFmt: pctAxis, sortTip: true,
+      aria: 'Доля производителей в категории по периодам',
       series: r.chart2.series.map(s => ({ name: META.producers[s.prod], color: prodColor(s.prod), values: s.values })) });
     c3.rows = r.chart3.map(x => [META.producers[x.prod], fmt.pct(x.share)]);
     c3.head = ['Производитель', 'Доля в категории, шт'];
@@ -1065,6 +1157,7 @@ footer p { margin: 4px 0; max-width: 1100px; }
     const t0 = performance.now();
     const r = compute(state);
     last = r;
+    renderPeriod(r.win);
     renderKpis(r);
     drawCharts(r);
     tBrands.set(r.brands.map(b => ({ ...b, name: META.brands[b.brand], own: isOwnBrand(b.brand) })));
@@ -1077,9 +1170,10 @@ footer p { margin: 4px 0; max-width: 1100px; }
   let resizeTimer = 0;
   new ResizeObserver(() => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => last && drawCharts(last), 120); }).observe(app);
   window.X5 = {
-    meta: META, state, compute,
+    meta: META, state, compute, periodWindow,
     set(patch) {
       for (const [k, v] of Object.entries(patch)) state[k] = v instanceof Array ? new Set(v) : v;
+      syncControls();
       renderAll();
       return last;
     },
