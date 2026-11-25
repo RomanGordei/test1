@@ -109,6 +109,10 @@ def build(contour):
     if START_YEAR:
         cal = cal[cal["Год"] >= START_YEAR]
     cal = cal.sort_values("НачалоПериода").reset_index(drop=True)
+    dup = cal.loc[cal["НачалоПериода"].duplicated(keep=False), "НачалоПериода"]
+    if len(dup):   # иначе все периоды после повтора съедут на один
+        raise SystemExit(f"СТОП. В x5_{contour}_calendar повторяется начало периода: "
+                         f"{', '.join(sorted({f'{d:%d.%m.%Y}' for d in dup}))}. Пересоберите куб исправленным билдером.")
     per_index = {d: i for i, d in enumerate(cal["НачалоПериода"])}
     pg = cal["НачалоПериодаПГ"].map(per_index).fillna(-1).astype(int)
 
@@ -1783,9 +1787,9 @@ input:focus-visible { outline-offset: 0; border-color: var(--accent); }
     promoCol, loyalCol, ...priceCols,
   ], { sortKey: 'sales', file: 'категории' });
   const tProds = dataTable([nameCol('Производитель'), salesCol, growthCol, shareCol, dShareCol, sharePbpCol, promoCol, loyalCol, ...priceCols,
-    indexCol, depthCol, tdpCol], { sortKey: 'sales', limit: 25, pinOwn: true, file: 'производители' });
+    indexCol, depthCol, tdpCol], { sortKey: 'sales', limit: 25, file: 'производители' });
   const tBrands = dataTable([nameCol('Бренд'), salesCol, growthCol, shareCol, dShareCol, sharePbpCol, promoCol, loyalCol, ...priceCols,
-    indexCol, depthCol, tdpCol], { sortKey: 'sales', limit: 25, pinOwn: true, file: 'бренды' });
+    indexCol, depthCol, tdpCol], { sortKey: 'sales', limit: 25, file: 'бренды' });
   const lineName = li => META.lines[li];
   const tLines = dataTable([
     { key: 'name', kind: 'text', title: 'Продуктовая линия · SKU',
@@ -1803,7 +1807,7 @@ input:focus-visible { outline-offset: 0; border-color: var(--accent); }
       hint: `Продажи SKU к числу магазинов с его продажами, в среднем за ${weekly ? 'неделю' : 'месяц'}; для линии — по всем её SKU` },
     { key: 'skuCount', kind: 'int', title: 'SKU', hint: 'SKU линии с продажами за период', render: r => el('td', { class: 'num', text: r.children ? fmt.int(r.skuCount) : '' }) },
     promoCol, { ...loyalCol, when: () => state.block === 'L' }, ...priceCols, indexCol, sharePbpCol,
-  ], { sortKey: 'sales', limit: 30, pinOwn: true, children: true, cls: 'lines', file: 'продуктовые_линии' });
+  ], { sortKey: 'sales', limit: 30, children: true, cls: 'lines', file: 'продуктовые_линии' });
   const geoColumns = extra => [...extra, salesCol, growthCol,
     { key: 'share', kind: 'pct', title: () => `Доля в категории${bw() ? ` (${bw()})` : ''}` }, dShareCol];
   const tNets = dataTable(geoColumns([{ key: 'name', kind: 'text', title: 'Сеть' }]), { sortKey: 'sales', file: 'сети' });
@@ -1813,9 +1817,9 @@ input:focus-visible { outline-offset: 0; border-color: var(--accent); }
   const tabs = tabsCard([
     { id: 'categories', label: 'Категории', table: tCats, file: 'категории', note: 'Вся ПБП в выбранных сетях и регионах · срезы продукта не применяются · доля — в ПБП' },
     { id: 'producers', label: 'Производители', table: tProds, file: 'производители', searchable: true,
-      note: 'Производители категорий из среза · срезы производителя и бренда не применяются · Маревен сверху' },
+      note: 'Производители категорий из среза · срезы производителя и бренда не применяются · Маревен выделен' },
     { id: 'brands', label: 'Бренды', table: tBrands, file: 'бренды', searchable: true,
-      note: 'Доля и индекс цены — от категорий из среза «Категория» в тех же сетях, регионах и периоде · бренды Маревен сверху' },
+      note: 'Доля и индекс цены — от категорий из среза «Категория» в тех же сетях, регионах и периоде · бренды Маревен выделены' },
     { id: 'lines', label: 'Продуктовые линии', table: tLines, file: 'продуктовые_линии', searchable: true,
       note: 'Нажмите на линию, чтобы увидеть её SKU с дистрибуцией · TDP линии — сумма ND её SKU · поиск находит и линии, и SKU' },
     { id: 'nets', label: 'Сети', table: tNets, file: 'сети', note: 'Доля — в категории своей сети' },

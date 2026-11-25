@@ -144,26 +144,37 @@ def read_source(name):
 
 def merge_split_periods(df, weekly):
     """X5 иногда режет период на части: 37-я неделя 2026 пришла как 07.09 (1 день) и 08–13.09.
-    Части одной недели (месяца) склеиваются в один период: продажи, чеки и покупатели складываются,
-    магазины и взвешенная дистрибуция берутся по большей части, дни продаж — через магазино-дни."""
+    Части одной недели (месяца) склеиваются в один период: начало — понедельник (1-е число), конец — последний день частей,
+    подпись — от самой длинной части, и всё это одинаково для всех строк периода. Продажи, чеки и покупатели складываются,
+    магазины и взвешенная дистрибуция берутся по большей части, дни продаж — через магазино-дни.
+    Пересекающиеся части — это не разрезанный период, а повтор загрузки: тогда стоп."""
     reach = ["TOTAL_Магазины", "PROMO_Магазины", "TOTAL_ВзвДистр"]   # охват по частям не складывается
-    start = df["НачалоПериода"].dt.to_period("W-SUN" if weekly else "M").dt.start_time
-    parts = df[["НачалоПериода", "КонецПериода"]].assign(Начало=start).drop_duplicates()
-    split = parts[parts.duplicated("Начало", keep=False)].sort_values("НачалоПериода")
+    key = ["НачалоПериода", "КонецПериода"]
+    per = df[key + ["Период"]].drop_duplicates(key).copy()
+    per["Начало"] = per["НачалоПериода"].dt.to_period("W-SUN" if weekly else "M").dt.start_time
+    split = per[per.duplicated("Начало", keep=False)].sort_values("НачалоПериода").copy()
     if split.empty:
         return df
+    split["Дней"] = (split["КонецПериода"] - split["НачалоПериода"]).dt.days + 1
     for begin, p in split.groupby("Начало"):
         pieces = ", ".join(f"{s:%d.%m}–{e:%d.%m.%Y}" for s, e in zip(p["НачалоПериода"], p["КонецПериода"]))
+        if (p["НачалоПериода"].to_numpy()[1:] <= p["КонецПериода"].to_numpy()[:-1]).any():
+            raise SystemExit(f"СТОП. Периоды {pieces} пересекаются: это повтор загрузки, а не разрезанный период.")
         log(f"  ! период пришёл частями: {pieces} -> склеен в {begin:%d.%m}–{p['КонецПериода'].max():%d.%m.%Y}; "
             f"магазины, взвешенная дистрибуция и покупатели в нём оценочные")
-    rows = df["НачалоПериода"].isin(split["НачалоПериода"])
-    part = df[rows].sort_values("НачалоПериода")
-    part = part.assign(НачалоПериода=start.loc[part.index],
+    split["НовыйКонец"] = split.groupby("Начало")["КонецПериода"].transform("max")
+    label = split.sort_values("Дней", ascending=False).drop_duplicates("Начало").set_index("Начало")["Период"]
+    split["НовыйПериод"] = split["Начало"].map(label)
+    m = split.set_index(key)
+    rows = pd.MultiIndex.from_frame(df[key]).isin(m.index)
+    part = df[rows]
+    at = pd.MultiIndex.from_frame(part[key])
+    part = part.assign(НачалоПериода=m["Начало"].reindex(at).to_numpy(), КонецПериода=m["НовыйКонец"].reindex(at).to_numpy(),
+                       Период=m["НовыйПериод"].reindex(at).to_numpy(),
                        ДниМагазинов=part["TOTAL_Магазины"] * part["TOTAL_ДнейПродаж"])
-    g = part.groupby(["НачалоПериода", "Сеть", "Регион", "PLU", "ЭтоИтог"], sort=False)
+    g = part.groupby(key + ["Период", "Сеть", "Регион", "PLU", "ЭтоИтог"], sort=False)
     plain = [c for c in BASE_COLS if c not in reach and c != "TOTAL_ДнейПродаж"] + ["ДниМагазинов"]
-    merged = pd.concat([g[plain].sum(min_count=1), g[reach].max(), g[["КонецПериода"]].max(),
-                        g[["Период", "ФО", "ГруппаТоваров"]].first()], axis=1).reset_index()
+    merged = pd.concat([g[plain].sum(min_count=1), g[reach].max(), g[["ФО", "ГруппаТоваров"]].first()], axis=1).reset_index()
     stores = merged["TOTAL_Магазины"].where(merged["TOTAL_Магазины"] > 0)
     merged["TOTAL_ДнейПродаж"] = (merged.pop("ДниМагазинов") / stores).round()
     return pd.concat([df[~rows], merged[df.columns]], ignore_index=True)
@@ -314,11 +325,19 @@ def main():
     products, regions = build_products(facts), build_regions(facts)
     networks = pd.concat(facts)[["Сеть"]].drop_duplicates().sort_values("Сеть")
 
+    # Календари — до записи файлов: начало периода — ключ связи в модели Excel, повтор не даст обновить куб
+    cals = {name: build_calendar(fact, weekly=(name == "weekly")) for name, (fact, _) in data.items()}
+    for name, cal in cals.items():
+        dup = cal[cal["НачалоПериода"].duplicated(keep=False)]
+        if len(dup):
+            raise SystemExit(f"СТОП. В календаре {name} повторяется начало периода, Excel не обновит куб:\n"
+                             f"{dup[['НачалоПериода', 'КонецПериода', 'Период']].to_string(index=False)}")
+
     log("\n[файлы]")
     for name, (fact, cat) in data.items():
         save(fact[CELL + ["PLU"] + BASE_COLS], f"x5_{name}_fact")
         save(cat[CELL + BASE_COLS], f"x5_{name}_category")
-        save(build_calendar(fact, weekly=(name == "weekly")), f"x5_{name}_calendar")
+        save(cals[name], f"x5_{name}_calendar")
     save(products, "x5_products")
     save(regions, "x5_regions")
     save(networks, "x5_networks")
