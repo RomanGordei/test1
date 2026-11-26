@@ -272,7 +272,15 @@ Private Sub WriteLog(ByVal text As String)
     logRow = logRow + 1
     wsLog.Cells(logRow, 1).Value = Format(Now, "hh:nn:ss")
     wsLog.Cells(logRow, 2).Value = "'" & text
-    Application.StatusBar = text
+    On Error Resume Next
+    Application.StatusBar = Left$(Replace(Replace(text, vbCr, " "), vbLf, " "), 200)
+    On Error GoTo 0
+End Sub
+
+Private Sub Status(ByVal text As String)
+    On Error Resume Next
+    Application.StatusBar = Left$(text, 200)
+    On Error GoTo 0
 End Sub
 
 Private Function CountOk() As Long
@@ -523,16 +531,47 @@ Private Sub AddM(ByVal nm As String, ByVal dax As String, ByVal fmt As Object)
     Dim d As String
     If known.Exists(nm) Then Err.Raise vbObjectError + 610, , "в модели уже есть мера «" & nm & "», созданная не сборщиком"
     On Error GoTo BadMeasure
-    wb.Model.ModelMeasures.Add nm, wb.Model.ModelTables(T_REPORT), dax, fmt
+    wb.Model.ModelMeasures.Add nm, wb.Model.ModelTables(T_REPORT), LocalDax(dax, ListSep()), fmt
     On Error GoTo 0
     known(nm) = True
+    Status "Создаю меры: " & known.Count
     Exit Sub
 BadMeasure:
     d = Err.Description
     WriteLog "Мера «" & nm & "» не создалась: " & d
-    WriteLog "Её формула: " & dax
-    Err.Raise vbObjectError + 611, , "мера «" & nm & "»: " & d
+    WriteLog "Её формула: " & LocalDax(dax, ListSep())
+    Err.Raise vbObjectError + 611, , "мера «" & nm & "» не создалась, текст ошибки и формула на листе «" & SH_LOG & "»"
 End Sub
+
+' Разделитель аргументов в формулах Excel и Power Pivot на этом компьютере (в русской версии «;»)
+Private Function ListSep() As String
+    ListSep = CStr(Application.International(5))   ' xlListSeparator
+    If Len(ListSep) = 0 Then ListSep = ","
+End Function
+
+' Меры записаны с запятой между аргументами. Power Pivot принимает формулу в местном виде,
+' поэтому запятые вне строк в кавычках и вне имён в [ ] и ' ' заменяются на местный разделитель.
+' Дробных чисел в мерах нет, поэтому десятичный разделитель не трогается.
+Private Function LocalDax(ByVal dax As String, ByVal sep As String) As String
+    Dim i As Long, ch As String, inText As Boolean, inBr As Boolean, inName As Boolean, out As String
+    If sep = "," Then LocalDax = dax: Exit Function
+    For i = 1 To Len(dax)
+        ch = Mid$(dax, i, 1)
+        If ch = Chr(34) And Not inBr And Not inName Then
+            inText = Not inText
+        ElseIf ch = "[" And Not inText And Not inName Then
+            inBr = True
+        ElseIf ch = "]" And inBr Then
+            inBr = False
+        ElseIf ch = "'" And Not inText And Not inBr Then
+            inName = Not inName
+        ElseIf ch = "," And Not inText And Not inBr And Not inName Then
+            ch = sep
+        End If
+        out = out & ch
+    Next
+    LocalDax = out
+End Function
 
 Private Function VarsWin() As String
     VarsWin = "VAR vEnd = [x5_Конец] VAR vStart = [x5_Начало] "
@@ -651,7 +690,9 @@ Private Sub BuildSummary()
         End With
     Next
     ws.Columns("AA:AL").Hidden = True
+    On Error Resume Next
     ws.Range("A1").Select
+    On Error GoTo 0
     WriteLog "Лист «" & SH_SUM & "» построен"
 End Sub
 
@@ -736,13 +777,17 @@ Private Sub BuildCategories()
     pt.ManualUpdate = False
     ConnectPivot pt
     TrySort pt, "[Продукты].[Категория].[Категория]", "[Measures].[x5 Продажи]"
+    On Error Resume Next
     With pt.TableRange1.Rows(1)
         .WrapText = True
         .RowHeight = 42
         .VerticalAlignment = XL_VCENTER
     End With
+    On Error GoTo 0
     ws.Columns("AA:AL").Hidden = True
+    On Error Resume Next
     ws.Range("A1").Select
+    On Error GoTo 0
     WriteLog "Лист «" & SH_CAT & "» построен"
 End Sub
 
@@ -788,7 +833,9 @@ Private Sub BuildCover()
     ws.Cells(19, 2).Value = "Следующие листы: Сегменты, Сети и регионы, Производители, Бренды и линии, SKU, Цены и промо, Лояльные покупки."
     ws.Cells(19, 2).Font.Color = C_MUTED
     ws.Columns("Z").Hidden = True
+    On Error Resume Next
     ws.Range("A1").Select
+    On Error GoTo 0
     WriteLog "Лист «" & SH_COVER & "» построен"
 End Sub
 
@@ -831,6 +878,7 @@ Private Sub BuildChecks()
              "+N(IFERROR(" & CV("x5 Вклад веса", ALL_SR) & ",0))+N(IFERROR(" & CV("x5 Вклад цены", ALL_SR) & ",0))"
     CheckRow ws, 10, "Разложение: полка + спрос + вес + цена = изменение продаж, млн руб", bridge, _
              "=N(IFERROR(" & CV("x5 Изм продаж руб", ALL_SR) & ",0))", 0.001
+    On Error Resume Next
     With ws.Range("E5:E10").FormatConditions
         .Delete
         With .Add(XL_CELL_VALUE, XL_EQUAL, "=""OK""")
@@ -842,13 +890,16 @@ Private Sub BuildChecks()
             .Font.Bold = True
         End With
     End With
+    On Error GoTo 0
     ws.Range("B12").Formula = "=""Итого: ""&COUNTIF(E5:E10,""OK"")&"" из 6 проверок OK"""
     ws.Range("B12").Font.Bold = True
     ws.Range("B14").Value = "Внешняя сверка: в HTML-дашборде с тем же месяцем, окном, сравнением и рынком продажи и прирост " & _
                             "должны совпасть с плиткой на листе «" & SH_SUM & "»."
     ws.Range("B14").Font.Color = C_INK2
     ws.Columns("AA:AD").Hidden = True
+    On Error Resume Next
     ws.Range("A1").Select
+    On Error GoTo 0
     WriteLog "Лист «" & SH_CHK & "» построен"
 End Sub
 
@@ -870,11 +921,14 @@ Private Function WinCube(ByVal measure As String, ByVal winName As String, ByVal
 End Function
 
 Private Sub OrderSheets()
+    On Error Resume Next
     wb.Worksheets(SH_COVER).Move Before:=wb.Worksheets(1)
     wb.Worksheets(SH_SUM).Move After:=wb.Worksheets(SH_COVER)
     wb.Worksheets(SH_CAT).Move After:=wb.Worksheets(SH_SUM)
     wb.Worksheets(SH_CHK).Move After:=wb.Worksheets(wb.Worksheets.Count)
     wb.Worksheets(SH_LOG).Move After:=wb.Worksheets(wb.Worksheets.Count)
+    If Err.Number <> 0 Then WriteLog "Порядок листов: " & Err.Description
+    On Error GoTo 0
 End Sub
 
 '==============================================================================
@@ -892,9 +946,11 @@ Private Function NewSheet(ByVal nm As String) As Object
     ws.Name = nm
     ws.CustomProperties.Add MARK, "1"
     ws.Cells.Font.Size = 10
+    On Error Resume Next
     ws.Activate
     ActiveWindow.DisplayGridlines = False
     ActiveWindow.Zoom = 90
+    On Error GoTo 0
     Set NewSheet = ws
 End Function
 
@@ -1012,16 +1068,28 @@ End Sub
 
 Private Sub MakeCache(ByVal pt As Object, ByVal nm As String, ByVal fld As String, ByVal sortMode As Long)
     Dim sc As Object, d As String
-    On Error GoTo BadCache
+    On Error Resume Next
     Set sc = wb.SlicerCaches.Add2(pt, fld, nm)
+    If sc Is Nothing Then
+        d = Err.Description
+        Err.Clear
+        Set sc = wb.SlicerCaches.Add2(pt, fld)
+        If Not sc Is Nothing Then sc.Name = nm
+    End If
+    If sc Is Nothing Then d = d & " / " & Err.Description
+    If Not sc Is Nothing Then
+        If sc.Name <> nm Then sc.Name = nm
+    End If
+    On Error GoTo 0
+    If sc Is Nothing Then
+        Err.Raise vbObjectError + 620, , "срез по полю " & fld & " не создался (" & d & "). Если столбец скрыт " & _
+            "в Power Pivot, покажите его: правый клик по столбцу > Показать в клиентских средствах"
+    End If
+    If sc.Name <> nm Then Err.Raise vbObjectError + 621, , "срез по полю " & fld & " получил имя «" & sc.Name & _
+                                                      "» вместо «" & nm & "», формулы отчёта на него не сошлются"
     On Error Resume Next
     sc.SortItems = sortMode
     On Error GoTo 0
-    Exit Sub
-BadCache:
-    d = Err.Description
-    Err.Raise vbObjectError + 620, , "срез по полю " & fld & " не создался (" & d & "). Если столбец скрыт " & _
-        "в Power Pivot, покажите его: правый клик по столбцу > Показать в клиентских средствах"
 End Sub
 
 ' Полоса срезов в строках 3-12: сверху окно, сравнение, единица, сеть; снизу месяц, ФО, регион, категория
@@ -1042,9 +1110,19 @@ End Sub
 Private Sub PutSlicer(ByVal ws As Object, ByVal key As String, ByVal cacheName As String, ByVal level As String, _
                       ByVal caption As String, ByVal T As Double, ByVal L As Double, ByVal W As Double, _
                       ByVal H As Double, ByVal nCols As Long)
-    Dim sl As Object
-    Set sl = wb.SlicerCaches(cacheName).Slicers.Add(ws, level, cacheName & "_" & key, caption, T, L, W, H)
+    Dim sl As Object, d As String
     On Error Resume Next
+    Set sl = wb.SlicerCaches(cacheName).Slicers.Add(ws, level, cacheName & "_" & key, caption, T, L, W, H)
+    If sl Is Nothing Then
+        d = Err.Description
+        Err.Clear
+        Set sl = wb.SlicerCaches(cacheName).Slicers.Add(ws, , cacheName & "_" & key, caption, T, L, W, H)
+    End If
+    If sl Is Nothing Then
+        d = d & " / " & Err.Description
+        On Error GoTo 0
+        Err.Raise vbObjectError + 622, , "срез «" & caption & "» не встал на лист «" & ws.Name & "» (" & d & ")"
+    End If
     sl.Style = "SlicerStyleLight1"
     sl.NumberOfColumns = nCols
     sl.RowHeight = 16
@@ -1055,7 +1133,10 @@ End Sub
 Private Sub ConnectPivot(ByVal pt As Object)
     Dim nm As Variant
     For Each nm In Split(CACHES, " ")
+        On Error Resume Next
         wb.SlicerCaches(CStr(nm)).PivotTables.AddPivotTable pt
+        If Err.Number <> 0 Then WriteLog "Сводная «" & pt.Name & "» не подключилась к срезу " & nm & ": " & Err.Description
+        On Error GoTo 0
     Next
 End Sub
 
@@ -1086,10 +1167,12 @@ End Sub
 Private Sub AddDataField(ByVal pt As Object, ByVal measure As String, ByVal caption As String, _
                          Optional ByVal fmt As String = "")
     Dim f As Object
-    Set f = pt.AddDataField(pt.CubeFields("[Measures].[" & measure & "]"), caption)
-    If Len(fmt) = 0 Then Exit Sub
+    Set f = pt.AddDataField(pt.CubeFields("[Measures].[" & measure & "]"))
     On Error Resume Next
-    f.NumberFormat = fmt
+    f.Caption = caption
+    If Err.Number <> 0 Then WriteLog "Подпись столбца «" & Trim$(caption) & "» не применилась: " & Err.Description
+    Err.Clear
+    If Len(fmt) > 0 Then f.NumberFormat = fmt
     If Err.Number <> 0 Then WriteLog "Формат столбца «" & Trim$(caption) & "» не применился: " & Err.Description
     On Error GoTo 0
 End Sub
@@ -1119,6 +1202,7 @@ Private Function NewChart(ByVal ws As Object, ByVal area As String) As Object
     Dim rng As Object, co As Object
     Set rng = ws.Range(area)
     Set co = ws.ChartObjects.Add(rng.Left, rng.Top, rng.Width, rng.Height)
+    On Error Resume Next
     With co.Chart
         Do While .SeriesCollection.Count > 0
             .SeriesCollection(1).Delete
@@ -1129,6 +1213,8 @@ Private Function NewChart(ByVal ws As Object, ByVal area As String) As Object
         .ChartArea.Font.Size = 9
         .ChartArea.Font.Color = C_INK2
     End With
+    If Err.Number <> 0 Then WriteLog "Оформление графика: " & Err.Description
+    On Error GoTo 0
     Set NewChart = co.Chart
 End Function
 
@@ -1143,6 +1229,7 @@ End Sub
 ' Линии: текущий период цветом, год назад серым пунктиром
 Private Sub StyleLines(ByVal ch As Object)
     ch.ChartType = XL_LINE
+    On Error Resume Next
     With ch.SeriesCollection(1).Format.Line
         .ForeColor.RGB = C_ACCENT
         .Weight = 2.25
@@ -1164,12 +1251,15 @@ Private Sub StyleLines(ByVal ch As Object)
     End With
     ch.HasLegend = True
     ch.Legend.Position = XL_TOP
+    If Err.Number <> 0 Then WriteLog "Оформление линейного графика: " & Err.Description
+    On Error GoTo 0
 End Sub
 
 ' Горизонтальные столбцы от нуля: ряды накладываются, пустые ячейки не рисуются
 Private Sub StyleBars(ByVal ch As Object, ByVal colors As Variant, ByVal labelFmt As String)
     Dim i As Long, s As Object
     ch.ChartType = XL_BAR
+    On Error Resume Next
     ch.ChartGroups(1).Overlap = 100
     ch.ChartGroups(1).GapWidth = 50
     For i = 1 To ch.SeriesCollection.Count
@@ -1193,4 +1283,6 @@ Private Sub StyleBars(ByVal ch As Object, ByVal colors As Variant, ByVal labelFm
     End With
     ch.HasLegend = True
     ch.Legend.Position = XL_TOP
+    If Err.Number <> 0 Then WriteLog "Оформление столбчатого графика: " & Err.Description
+    On Error GoTo 0
 End Sub
