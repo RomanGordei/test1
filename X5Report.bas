@@ -65,6 +65,8 @@ Private wb As Object                ' книга куба, в которой строится отчёт
 Private wsLog As Object
 Private logRow As Long
 Private known As Object             ' имена мер, которые уже есть в модели
+Private srOk As Object              ' срезы, которые удалось создать (имя кэша -> True)
+Private scWay As Long               ' способ создания среза, который сработал
 Private fDec0 As Object, fDec1 As Object, fPct1 As Object, fInt As Object, fCode As Object, fGen As Object
 Private Q As String, UPA As String, DNA As String, ARW As String
 Private ALL_SR As String, MKT_SR As String
@@ -79,7 +81,7 @@ Private C_INK As Long, C_INK2 As Long, C_MUTED As Long, C_GRID As Long, C_TILE A
 
 ' Собирает (или пересобирает) отчёт в активной книге куба
 Public Sub СобратьОтчёт()
-    Dim stepName As String, failMsg As String, ok As Boolean
+    Dim stepName As String, failMsg As String, ok As Boolean, msg As String, miss As String
     If Not PickWorkbook() Then Exit Sub
     InitConsts
     On Error GoTo Fail
@@ -108,7 +110,15 @@ Finish:
     If ok Then
         WriteLog "Готово. Проверки: " & CountOk() & " из 6 OK."
         wb.Worksheets(SH_COVER).Activate
-        MsgBox "Отчёт собран. Проверки: " & CountOk() & " из 6 OK (лист «" & SH_CHK & "»).", vbInformation, "Сборка отчёта"
+        msg = "Отчёт собран. Проверки: " & CountOk() & " из 6 OK (лист «" & SH_CHK & "»)."
+        miss = MissingSlicers()
+        If Len(miss) > 0 Then
+            msg = msg & vbLf & vbLf & "Не создались срезы: " & miss & ". Вместо них отчёт берёт значения по умолчанию " & _
+                  "(последний месяц, MAT к YA, рубли, весь рынок). Подробности на листе «" & SH_LOG & "»."
+            MsgBox msg, vbExclamation, "Сборка отчёта"
+        Else
+            MsgBox msg, vbInformation, "Сборка отчёта"
+        End If
     Else
         WriteLog failMsg
         If Not wsLog Is Nothing Then wsLog.Activate
@@ -187,6 +197,8 @@ End Function
 
 Private Sub InitConsts()
     Q = Chr(34): UPA = ChrW(9650): DNA = ChrW(9660): ARW = ChrW(8594)
+    Set srOk = CreateObject("Scripting.Dictionary")
+    scWay = 0
     ALL_SR = "srPeriod,srWindow,srCompare,srUnit,srNet,srFO,srRegion,srCat"
     MKT_SR = "srNet,srFO,srRegion,srCat"
     ' форматы плиток: стрелка и цвет для роста и доли, нейтральный знак для цен и промо
@@ -297,9 +309,10 @@ End Function
 
 ' Удаляет листы, срезы и меры прошлой сборки. Лист с таблицами выбора и журнал остаются.
 Private Sub RemoveOldBuild()
-    Dim i As Long, n As Long, ws As Object
-    For i = wb.SlicerCaches.Count To 1 Step -1
-        If InStr(" " & CACHES & " ", " " & wb.SlicerCaches(i).Name & " ") > 0 Then wb.SlicerCaches(i).Delete
+    Dim i As Long, n As Long, ws As Object, xb As Excel.Workbook
+    Set xb = wb
+    For i = xb.SlicerCaches.Count To 1 Step -1
+        If InStr(" " & CACHES & " ", " " & xb.SlicerCaches(i).Name & " ") > 0 Then xb.SlicerCaches(i).Delete
     Next
     For i = wb.Worksheets.Count To 1 Step -1
         Set ws = wb.Worksheets(i)
@@ -637,7 +650,6 @@ Private Sub BuildSummary()
     pt.RowGrand = False
     pt.ManualUpdate = False
     MakeCaches pt
-    WriteLog "Срезы созданы"
 
     Header ws, "Что произошло за период и что это значит для Маревен"
     AddSlicerBand ws, "sum"
@@ -721,11 +733,11 @@ Private Sub BuildCategories()
     ws.Range("AC5:AC29").Formula = "=""[Календарь].[Период].&[""&(INT(AB5/12)*100+MOD(AB5,12)+1)&""]"""
     ws.Range("AD5:AD29").Formula = "=CHOOSE(MOD(AB5,12)+1,""янв"",""фев"",""мар"",""апр"",""май"",""июн""," & _
                                    """июл"",""авг"",""сен"",""окт"",""ноя"",""дек"")&"" ""&RIGHT(INT(AB5/12),2)"
-    ws.Range("AE5:AE29").Formula = "=IFERROR(CUBEVALUE(""" & CN & """,""[Measures].[x5 Продажи мес]"",AC5," & _
-                                   MKT_SR & ",srUnit),"""")"
+    ws.Range("AE5:AE29").Formula = "=IFERROR(CUBEVALUE(""" & CN & """,""[Measures].[x5 Продажи мес]"",AC5" & _
+                                   SRL(MKT_SR & ",srUnit") & "),"""")"
     ws.Range("AF5:AF29").Formula = "=IF(ISNUMBER(AE5),AE5,NA())"
-    ws.Range("AG5:AG29").Formula = "=IFERROR(CUBEVALUE(""" & CN & """,""[Measures].[x5 Продажи YA мес]"",AC5," & _
-                                   MKT_SR & ",srUnit),"""")"
+    ws.Range("AG5:AG29").Formula = "=IFERROR(CUBEVALUE(""" & CN & """,""[Measures].[x5 Продажи YA мес]"",AC5" & _
+                                   SRL(MKT_SR & ",srUnit") & "),"""")"
     ws.Range("AH5:AH29").Formula = "=IF(ISNUMBER(AG5),AG5,NA())"
 
     SectionTitle ws, "B22", "=""Продажи по месяцам, ""&" & CV("x5_Подпись единицы", "srUnit")
@@ -827,7 +839,7 @@ Private Sub BuildCover()
                   Array(SH_CHK, "Сходятся ли меры отчёта с суммами по месяцам"))
     For i = 0 To UBound(items)
         r = 15 + i
-        ws.Hyperlinks.Add ws.Cells(r, 2), "", "'" & items(i)(0) & "'!A1", , items(i)(0)
+        ws.Hyperlinks.Add ws.Cells(r, 2), "", "'" & items(i)(0) & "'!A1", , CStr(items(i)(0))
         ws.Cells(r, 3).Value = items(i)(1)
     Next
     ws.Cells(19, 2).Value = "Следующие листы: Сегменты, Сети и регионы, Производители, Бренды и линии, SKU, Цены и промо, Лояльные покупки."
@@ -860,7 +872,7 @@ Private Sub BuildChecks()
     Next
     ws.Range("AB5:AB40").Formula = "=INT($AA$3/100)*12+MOD($AA$3,100)-1-AA5"
     ws.Range("AC5:AC40").Formula = "=""[Календарь].[Период].&[""&(INT(AB5/12)*100+MOD(AB5,12)+1)&""]"""
-    ws.Range("AD5:AD40").Formula = "=N(IFERROR(CUBEVALUE(""" & CN & """,""[Measures].[x5_Руб мес]"",AC5," & MKT_SR & "),0))"
+    ws.Range("AD5:AD40").Formula = "=N(IFERROR(CUBEVALUE(""" & CN & """,""[Measures].[x5_Руб мес]"",AC5" & SRL(MKT_SR) & "),0))"
 
     ws.Range("B4").Value = "Проверка"
     ws.Range("C4").Value = "Мера отчёта"
@@ -917,7 +929,7 @@ Private Function WinCube(ByVal measure As String, ByVal winName As String, ByVal
     Dim m As String
     m = ",""[Окно].[Окно].&[" & winName & "]"""
     If Len(cmpName) > 0 Then m = m & ",""[Сравнение].[Сравнение].&[" & cmpName & "]"""
-    WinCube = "=N(IFERROR(CUBEVALUE(""" & CN & """,""[Measures].[" & measure & "]"",srPeriod," & MKT_SR & m & "),0))"
+    WinCube = "=N(IFERROR(CUBEVALUE(""" & CN & """,""[Measures].[" & measure & "]""" & SRL("srPeriod," & MKT_SR) & m & "),0))"
 End Function
 
 Private Sub OrderSheets()
@@ -1040,9 +1052,42 @@ End Sub
 
 ' Формула CUBEVALUE для меры отчёта с перечнем срезов
 Private Function CV(ByVal measure As String, ByVal slicers As String) As String
-    CV = "CUBEVALUE(""" & CN & """,""[Measures].[" & measure & "]"""
-    If Len(slicers) > 0 Then CV = CV & "," & slicers
-    CV = CV & ")"
+    CV = "CUBEVALUE(""" & CN & """,""[Measures].[" & measure & "]""" & SRL(slicers) & ")"
+End Function
+
+' Срезы для формул: только созданные. Возвращает ",srPeriod,srWindow" или пустую строку
+Private Function SRL(ByVal names As String) As String
+    Dim p As Variant, s As String
+    For Each p In Split(names, ",")
+        s = Trim$(CStr(p))
+        If Len(s) > 0 Then
+            If srOk.Exists(s) Then SRL = SRL & "," & s
+        End If
+    Next
+End Function
+
+' Подписи срезов, которые не создались, через запятую
+Private Function MissingSlicers() As String
+    Dim nm As Variant, s As String
+    If srOk Is Nothing Then Exit Function
+    For Each nm In Split(CACHES, " ")
+        If Not srOk.Exists(CStr(nm)) Then s = s & ", " & SlicerCaption(CStr(nm))
+    Next
+    If Len(s) > 0 Then MissingSlicers = Mid$(s, 3)
+End Function
+
+Private Function SlicerCaption(ByVal nm As String) As String
+    Select Case nm
+        Case "srPeriod": SlicerCaption = "Последний месяц"
+        Case "srWindow": SlicerCaption = "Окно"
+        Case "srCompare": SlicerCaption = "Сравнение"
+        Case "srUnit": SlicerCaption = "Единица"
+        Case "srNet": SlicerCaption = "Сеть"
+        Case "srFO": SlicerCaption = "ФО"
+        Case "srRegion": SlicerCaption = "Регион"
+        Case "srCat": SlicerCaption = "Категория"
+        Case Else: SlicerCaption = nm
+    End Select
 End Function
 
 ' Подпись месяца по коду ГГГГММ из ячейки: «октябрь 2026»
@@ -1064,39 +1109,86 @@ Private Sub MakeCaches(ByVal pt As Object)
     MakeCache pt, "srFO", "[Регионы].[ФО]", XL_SORT_SOURCE
     MakeCache pt, "srRegion", "[Регионы].[СубъектРФ]", XL_SORT_SOURCE
     MakeCache pt, "srCat", "[Продукты].[Категория]", XL_SORT_SOURCE
+    If srOk.Count = 0 Then
+        WriteLog "Срезы не создались. Отчёт строится без них, на значениях по умолчанию: " & _
+                 "последний месяц, MAT к YA, рубли, весь рынок"
+    Else
+        WriteLog "Срезы созданы: " & srOk.Count & " из 8 (способ " & scWay & ")"
+    End If
 End Sub
 
+' Срезы создаются через типы Excel (ранняя привязка). Через «As Object» Excel получает имя поля
+' по ссылке, и SlicerCaches.Add2 отвечает «Invalid procedure call or argument».
+' Если срез не создаётся ни одним способом, сборка идёт дальше без него, причина — в журнале.
 Private Sub MakeCache(ByVal pt As Object, ByVal nm As String, ByVal fld As String, ByVal sortMode As Long)
-    ' Срез по модели данных создаётся от подключения ThisWorkbookDataModel, сводные подключаются к нему потом.
-    ' Если Excel так не примет, вторая попытка — от сводной.
-    Dim sc As Object, d As String
+    Dim sc As Excel.SlicerCache, xpt As Excel.PivotTable, p As Excel.PivotTable, d As String, way As Long, linked As Boolean, lv As Object
+    If scWay > 0 Then Set sc = AddCacheWay(scWay, pt, fld, nm, d)
+    Do While sc Is Nothing And way < 5
+        way = way + 1
+        If way <> scWay Then
+            Set sc = AddCacheWay(way, pt, fld, nm, d)
+            If Not sc Is Nothing Then scWay = way
+        End If
+    Loop
+    If sc Is Nothing Then
+        WriteLog "Срез «" & SlicerCaption(nm) & "» (" & fld & ") не создался:" & d
+        Exit Sub
+    End If
     On Error Resume Next
-    Set sc = wb.SlicerCaches.Add2(wb.Connections(CN), fld, nm)
-    If sc Is Nothing Then
-        d = Err.Description
-        Err.Clear
-        Set sc = wb.SlicerCaches.Add2(wb.Connections(CN), fld)
-    End If
-    If sc Is Nothing Then
-        d = d & " / " & Err.Description
-        Err.Clear
-        Set sc = wb.SlicerCaches.Add2(pt, fld, nm)
-    End If
-    If sc Is Nothing Then d = d & " / " & Err.Description
-    If Not sc Is Nothing Then
-        If sc.Name <> nm Then sc.Name = nm
-        sc.PivotTables.AddPivotTable pt
-    End If
+    If sc.Name <> nm Then sc.Name = nm
     On Error GoTo 0
-    If sc Is Nothing Then
-        Err.Raise vbObjectError + 620, , "срез по полю " & fld & " не создался (" & d & ")"
+    If sc.Name <> nm Then
+        WriteLog "Срез «" & SlicerCaption(nm) & "» получил имя «" & sc.Name & "» вместо «" & nm & _
+                 "», формулы на него не сошлются. Убираю его"
+        On Error Resume Next
+        sc.Delete
+        On Error GoTo 0
+        Exit Sub
     End If
-    If sc.Name <> nm Then Err.Raise vbObjectError + 621, , "срез по полю " & fld & " получил имя «" & sc.Name & _
-                                                      "» вместо «" & nm & "», формулы отчёта на него не сошлются"
+    srOk(nm) = True
+    Set xpt = pt
     On Error Resume Next
+    For Each p In sc.PivotTables
+        If p.Name = xpt.Name And p.Parent.Name = xpt.Parent.Name Then linked = True
+    Next
+    Err.Clear
+    If Not linked Then
+        sc.PivotTables.AddPivotTable xpt
+        If Err.Number <> 0 Then WriteLog "Сводная «" & xpt.Name & "» не подключилась к срезу " & nm & ": " & Err.Description
+        Err.Clear
+    End If
     sc.SortItems = sortMode
+    Set lv = sc.SlicerCacheLevels(1)
+    lv.SortItems = sortMode
     On Error GoTo 0
 End Sub
+
+' Один способ создать кэш среза. При ошибке возвращает Nothing и дописывает причину в d.
+Private Function AddCacheWay(ByVal way As Long, ByVal pt As Object, ByVal fld As String, ByVal nm As String, _
+                             ByRef d As String) As Excel.SlicerCache
+    Dim xb As Excel.Workbook, xpt As Excel.PivotTable, o As Object
+    Set xb = wb
+    On Error Resume Next
+    Select Case way
+        Case 1   ' от модели данных, как «Вставка > Срез > Модель данных»
+            Set AddCacheWay = xb.SlicerCaches.Add2(xb.Connections(CN), fld, nm)
+        Case 2   ' от сводной, как «Анализ сводной таблицы > Вставить срез»
+            Set xpt = pt
+            Set AddCacheWay = xb.SlicerCaches.Add2(xpt, fld, nm)
+        Case 3   ' от имени подключения
+            Set AddCacheWay = xb.SlicerCaches.Add2(CN, fld, nm)
+        Case 4   ' поздняя привязка, аргументы по значению
+            Set o = wb.SlicerCaches.Add2(wb.Connections(CN), CStr(fld), CStr(nm))
+            Set AddCacheWay = o
+        Case 5   ' старый метод Add (Excel 2010)
+            Set AddCacheWay = xb.SlicerCaches.Add(xb.Connections(CN), fld, nm)
+    End Select
+    If Err.Number <> 0 Then d = d & " | способ " & way & ": " & Err.Description
+    Err.Clear
+    If AddCacheWay Is Nothing Then Set AddCacheWay = xb.SlicerCaches(nm)   ' вдруг создался, но Excel ответил ошибкой
+    Err.Clear
+    On Error GoTo 0
+End Function
 
 ' Полоса срезов в строках 3-12: сверху окно, сравнение, единица, сеть; снизу месяц, ФО, регион, категория
 Private Sub AddSlicerBand(ByVal ws As Object, ByVal key As String)
@@ -1116,18 +1208,26 @@ End Sub
 Private Sub PutSlicer(ByVal ws As Object, ByVal key As String, ByVal cacheName As String, ByVal level As String, _
                       ByVal caption As String, ByVal T As Double, ByVal L As Double, ByVal W As Double, _
                       ByVal H As Double, ByVal nCols As Long)
-    Dim sl As Object, d As String
+    ' Тоже через типы Excel. Если срез не встал, сборка идёт дальше: формулы работают и без него на листе.
+    Dim xb As Excel.Workbook, xws As Excel.Worksheet, sc As Excel.SlicerCache, sl As Excel.Slicer, sName As String, d As String
+    If Not srOk.Exists(cacheName) Then Exit Sub
+    Set xb = wb
+    Set xws = ws
+    sName = cacheName & "_" & key
     On Error Resume Next
-    Set sl = wb.SlicerCaches(cacheName).Slicers.Add(ws, level, cacheName & "_" & key, caption, T, L, W, H)
-    If sl Is Nothing Then
-        d = Err.Description
-        Err.Clear
-        Set sl = wb.SlicerCaches(cacheName).Slicers.Add(ws, , cacheName & "_" & key, caption, T, L, W, H)
+    Set sc = xb.SlicerCaches(cacheName)
+    If Not sc Is Nothing Then
+        Set sl = sc.Slicers.Add(xws, level, sName, caption, T, L, W, H)
+        If sl Is Nothing Then
+            d = Err.Description
+            Err.Clear
+            Set sl = sc.Slicers.Add(xws, , sName, caption, T, L, W, H)
+        End If
     End If
     If sl Is Nothing Then
-        d = d & " / " & Err.Description
+        WriteLog "Срез «" & caption & "» не встал на лист «" & xws.Name & "»: " & d & " / " & Err.Description
         On Error GoTo 0
-        Err.Raise vbObjectError + 622, , "срез «" & caption & "» не встал на лист «" & ws.Name & "» (" & d & ")"
+        Exit Sub
     End If
     sl.Style = "SlicerStyleLight1"
     sl.NumberOfColumns = nCols
@@ -1135,14 +1235,18 @@ Private Sub PutSlicer(ByVal ws As Object, ByVal key As String, ByVal cacheName A
     On Error GoTo 0
 End Sub
 
-' Подключает сводную ко всем срезам книги
+' Подключает сводную ко всем созданным срезам книги
 Private Sub ConnectPivot(ByVal pt As Object)
-    Dim nm As Variant
+    Dim nm As Variant, xb As Excel.Workbook, xpt As Excel.PivotTable
+    Set xb = wb
+    Set xpt = pt
     For Each nm In Split(CACHES, " ")
-        On Error Resume Next
-        wb.SlicerCaches(CStr(nm)).PivotTables.AddPivotTable pt
-        If Err.Number <> 0 Then WriteLog "Сводная «" & pt.Name & "» не подключилась к срезу " & nm & ": " & Err.Description
-        On Error GoTo 0
+        If srOk.Exists(CStr(nm)) Then
+            On Error Resume Next
+            xb.SlicerCaches(CStr(nm)).PivotTables.AddPivotTable xpt
+            If Err.Number <> 0 Then WriteLog "Сводная «" & xpt.Name & "» не подключилась к срезу " & nm & ": " & Err.Description
+            On Error GoTo 0
+        End If
     Next
 End Sub
 
@@ -1225,12 +1329,25 @@ Private Function NewChart(ByVal ws As Object, ByVal area As String) As Object
 End Function
 
 Private Sub AddSeries(ByVal ch As Object, ByVal nm As String, ByVal vals As Object, ByVal cats As Object)
+    ' Ряд ссылается на диапазон. Если Excel не примет диапазон, ряд задаётся формулой =SERIES(...).
+    ' Ошибка графика не останавливает сборку, она пишется в журнал.
     Dim s As Object
+    On Error Resume Next
     Set s = ch.SeriesCollection.NewSeries
     s.Name = nm
     s.Values = vals
     s.XValues = cats
+    If Err.Number <> 0 Then
+        Err.Clear
+        s.Formula = "=SERIES(""" & nm & """," & RefA1(cats) & "," & RefA1(vals) & "," & ch.SeriesCollection.Count & ")"
+        If Err.Number <> 0 Then WriteLog "Ряд «" & nm & "» графика не задался: " & Err.Description
+    End If
+    On Error GoTo 0
 End Sub
+
+Private Function RefA1(ByVal rng As Object) As String
+    RefA1 = "'" & Replace(rng.Worksheet.Name, "'", "''") & "'!" & rng.Address
+End Function
 
 ' Линии: текущий период цветом, год назад серым пунктиром
 Private Sub StyleLines(ByVal ch As Object)
