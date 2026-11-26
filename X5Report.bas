@@ -1067,23 +1067,29 @@ Private Sub MakeCaches(ByVal pt As Object)
 End Sub
 
 Private Sub MakeCache(ByVal pt As Object, ByVal nm As String, ByVal fld As String, ByVal sortMode As Long)
+    ' Срез по модели данных создаётся от подключения ThisWorkbookDataModel, сводные подключаются к нему потом.
+    ' Если Excel так не примет, вторая попытка — от сводной.
     Dim sc As Object, d As String
     On Error Resume Next
-    Set sc = wb.SlicerCaches.Add2(pt, fld, nm)
+    Set sc = wb.SlicerCaches.Add2(wb.Connections(CN), fld, nm)
     If sc Is Nothing Then
         d = Err.Description
         Err.Clear
-        Set sc = wb.SlicerCaches.Add2(pt, fld)
-        If Not sc Is Nothing Then sc.Name = nm
+        Set sc = wb.SlicerCaches.Add2(wb.Connections(CN), fld)
+    End If
+    If sc Is Nothing Then
+        d = d & " / " & Err.Description
+        Err.Clear
+        Set sc = wb.SlicerCaches.Add2(pt, fld, nm)
     End If
     If sc Is Nothing Then d = d & " / " & Err.Description
     If Not sc Is Nothing Then
         If sc.Name <> nm Then sc.Name = nm
+        sc.PivotTables.AddPivotTable pt
     End If
     On Error GoTo 0
     If sc Is Nothing Then
-        Err.Raise vbObjectError + 620, , "срез по полю " & fld & " не создался (" & d & "). Если столбец скрыт " & _
-            "в Power Pivot, покажите его: правый клик по столбцу > Показать в клиентских средствах"
+        Err.Raise vbObjectError + 620, , "срез по полю " & fld & " не создался (" & d & ")"
     End If
     If sc.Name <> nm Then Err.Raise vbObjectError + 621, , "срез по полю " & fld & " получил имя «" & sc.Name & _
                                                       "» вместо «" & nm & "», формулы отчёта на него не сошлются"
